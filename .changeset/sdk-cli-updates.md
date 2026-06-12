@@ -3,11 +3,21 @@
 "@bradygaster/squad-cli": minor
 ---
 
-Update Squad SDK and CLI with improvements to storage providers, stream resolvers, and skill/template enhancements across multiple packages.
+Update Squad SDK and CLI with comprehensive improvements to storage providers, stream resolvers, and skill/template enhancements across the platform.
 
-- Enhanced storage provider implementations (fs, in-memory, sqlite)
-- Updated stream resolver functionality
-- Improved skill templates for cross-machine coordination, e2e testing, error recovery, external comms, and fact-checking
-- Synchronized templates across SDK and CLI distributions
-- Updated session initialization reference documentation
-- Enhanced PowerShell scripts for note-taking capabilities
+## Storage & Streaming
+- Enhanced storage provider implementations with support for filesystem, in-memory, and SQLite backends
+- Improved stream resolver functionality for better data flow handling
+
+## Skills & Templates
+- Enhanced skill templates for:
+  - Cross-machine coordination and distributed workflows
+  - End-to-end (e2e) testing capabilities
+  - Error recovery and resilience
+  - External communications integration
+  - Fact-checking and validation
+- Synchronized templates across SDK and CLI distributions for consistency
+
+## Documentation & Tooling
+- Updated session initialization reference documentation for improved developer experience
+- Enhanced PowerShell scripts with expanded note-taking capabilities
