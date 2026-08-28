@@ -10,9 +10,11 @@
  * @module cli/self-update
  */
 
-import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { FSStorageProvider } from '@bradygaster/squad-sdk';
+
+const storage = new FSStorageProvider();
 import { compareVersions } from './upgrade.js';
 import { BOLD, RESET, DIM, YELLOW } from './core/output.js';
 
@@ -21,7 +23,7 @@ const REGISTRY_URL = `https://registry.npmjs.org/${PACKAGE_NAME}`;
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const FETCH_TIMEOUT_MS = 3000; // 3 seconds
 
-interface CacheData {
+export interface CacheData {
   latestVersion: string;
   checkedAt: number;
 }
@@ -35,14 +37,16 @@ function getCacheDir(): string {
   return path.join(base, 'squad-cli');
 }
 
-function getCachePath(): string {
+/** Path to the update-check cache file (shared with `squad update-check`). */
+export function getCachePath(): string {
   return path.join(getCacheDir(), 'update-check.json');
 }
 
 /** Read cached version check result, if still valid. */
 function readCache(): CacheData | null {
   try {
-    const raw = fs.readFileSync(getCachePath(), 'utf8');
+    const raw = storage.readSync(getCachePath());
+    if (!raw) return null;
     const data: CacheData = JSON.parse(raw);
     if (Date.now() - data.checkedAt < CACHE_TTL_MS) {
       return data;
@@ -54,18 +58,18 @@ function readCache(): CacheData | null {
 }
 
 /** Write version check result to cache. */
-function writeCache(data: CacheData): void {
+export function writeCache(data: CacheData): void {
   try {
     const dir = getCacheDir();
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(getCachePath(), JSON.stringify(data), 'utf8');
+    storage.mkdirSync(dir, { recursive: true });
+    storage.writeSync(getCachePath(), JSON.stringify(data));
   } catch {
     // Non-critical — silently ignore write failures
   }
 }
 
 /** Fetch latest version from npm registry with timeout. */
-async function fetchLatestVersion(): Promise<string | null> {
+export async function fetchLatestVersion(): Promise<string | null> {
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);

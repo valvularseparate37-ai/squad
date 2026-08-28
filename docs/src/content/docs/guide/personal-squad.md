@@ -2,6 +2,7 @@
 
 > ⚠️ **Experimental** — Squad is alpha software. APIs, commands, and behavior may change between releases.
 
+> **Tip — Git helps protect your project state:** We strongly recommend using git to version-control your project `.squad/` directory. Every session writes to it — decisions, logs, orchestration history. Agent charters, skills, and casting histories live in your personal squad directory (not committed to projects). Without version control, context window resets, crashes, or accidental deletions could be unrecoverable. If git isn't an option, regular manual backups to external storage or cloud sync can help protect your work.
 
 **Try this:**
 ```bash
@@ -120,6 +121,14 @@ This is your **team identity**. It contains:
 ```
 
 This is the stuff that makes your agents *yours*. It persists across sessions. It grows as you work. It follows you from project to project.
+
+### The global `squad.agent.md` — a reference, not a live file
+
+You'll also see `.github/agents/squad.agent.md` inside your global config directory. This file is **not** discoverable by GitHub Copilot — Copilot only reads agent files inside a git repository's `.github/agents/` folder.
+
+So why is it there? It serves as a **local reference** of the Squad agent instructions that were applied to your projects. The actual source for `squad init` is the packaged template bundled with the CLI (`squad.agent.md.template`), so the global copy is not used as input for future inits. It exists so you can see what Squad generated without opening a project.
+
+If you want Copilot to use Squad's agent instructions in a project, run `squad init` in that project's root — that creates the "real" `.github/agents/squad.agent.md` inside the git repo where Copilot can discover it.
 
 ### The project pointer: `.squad/config.json`
 
@@ -310,11 +319,26 @@ We're building in the open. If something feels off, [open an issue](https://gith
 
 ## Tips
 
-- **Start with one project.** Get comfortable with the personal squad on one repo before connecting others. The value compounds, but so does confusion if something's misconfigured.
-- **Commit project `.squad/` but not personal squad directory.** The project-local state (decisions, logs) belongs in version control. Your global identity is personal — keep it out of repos.
+- **Git-first workflow is strongly recommended.** Commit your project `.squad/` directory to git after any session. Without version control:
+  - Session state could be lost on crashes, context resets, or machine reboots
+  - Project-local decisions and logs are at risk
+  - Accidental deletions may be unrecoverable
+  - Cross-project context could vanish
+  
+  Think of git as your insurance policy for your project's local state. It's a good habit: after a session ends, run `git add -- .squad/ && git commit -m "squad: project state"`. (Agent histories, skills, and team identity are stored in your personal squad directory — not in project repos.)
+
+- **Commit project `.squad/` but not personal squad directory.** The project-local state (decisions, logs) belongs in version control. Your global identity (agents, skills, casting) is personal — keep it out of repos.
+  ```bash
+  # DO THIS
+  git add -- .squad/
+  git commit -m "squad: project state"
+  
+  # DON'T commit your personal squad directory (~/.config/squad/ or similar) — it's machine-specific
+  ```
+
 - **Check status anytime.** `squad status` shows your global squad directory and which projects are connected.
 - **Skills are the payoff.** The more projects you work across, the more skills accumulate. After a month, your agents have a real knowledge base tailored to how *you* build software.
-- **It's just files.** Your personal squad directory is a folder on your machine. You can browse it, edit it, back it up, copy it to another machine manually. No magic, no cloud, no lock-in.
+- **It's just files.** Your personal squad directory is a folder on your machine. You can browse it, edit it, back it up, copy it to another machine manually. No magic, no cloud, no lock-in. But **always back up or version-control your `.squad/` state**.
 - **Global install matters.** `npm install -g @bradygaster/squad-cli` gives you the `squad` command everywhere. Without it, you'd need `npx` in each project. Global CLI + global squad = full portability.
 
 ---

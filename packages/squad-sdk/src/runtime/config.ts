@@ -7,11 +7,14 @@
  * @module runtime/config
  */
 
-import { readFileSync, existsSync } from 'fs';
 import { join, resolve, dirname } from 'path';
 import { pathToFileURL } from 'url';
+import { FSStorageProvider } from '../storage/fs-storage-provider.js';
 import { MODELS } from './constants.js';
 import type { AgentRole } from './constants.js';
+import { MODEL_CATALOG } from '../config/models.js';
+
+const storage = new FSStorageProvider();
 
 // ============================================================================
 // Configuration Types (from spike #72)
@@ -61,6 +64,14 @@ export interface ModelSelectionConfig {
   
   /** Default tier when no specific model is chosen */
   defaultTier: ModelTier;
+  
+  /**
+   * Cost-ceiling policy (cost axis, separate from tier/quality axis).
+   * Issue #1080 / #1183. No-op when `maxCategory` is unset.
+   */
+  costPolicy?: {
+    maxCategory?: 'lightweight' | 'versatile' | 'powerful';
+  };
   
   /** Task output type → model mapping */
   taskRules?: TaskToModelRule[];
@@ -439,7 +450,7 @@ export function discoverConfigFile(cwd: string = process.cwd()): string | undefi
   while (true) {
     for (const configFile of configFiles) {
       const configPath = join(currentDir, configFile);
-      if (existsSync(configPath)) {
+      if (storage.existsSync(configPath)) {
         return configPath;
       }
     }
@@ -482,7 +493,7 @@ export async function loadConfig(cwd: string = process.cwd()): Promise<ConfigLoa
   ];
   
   for (const { path: configPath, type } of localConfigs) {
-    if (existsSync(configPath)) {
+    if (storage.existsSync(configPath)) {
       try {
         if (type === 'ts' || type === 'js') {
           const configUrl = pathToFileURL(configPath).href;
@@ -500,7 +511,7 @@ export async function loadConfig(cwd: string = process.cwd()): Promise<ConfigLoa
             isDefault: false
           };
         } else {
-          const content = readFileSync(configPath, 'utf-8');
+          const content = storage.readSync(configPath) ?? '';
           const config = JSON.parse(content);
           const validated = validateConfig(config);
           
@@ -539,7 +550,7 @@ export async function loadConfig(cwd: string = process.cwd()): Promise<ConfigLoa
           isDefault: false
         };
       } else {
-        const content = readFileSync(discoveredPath, 'utf-8');
+        const content = storage.readSync(discoveredPath) ?? '';
         const config = JSON.parse(content);
         const validated = validateConfig(config);
         
@@ -598,10 +609,26 @@ export function validateConfigDetailed(config: unknown): ValidationResult {
     
     if (!models.defaultModel || typeof models.defaultModel !== 'string') {
       errors.push('config.models.defaultModel is required and must be a string');
+    } else if (!MODEL_CATALOG.some(m => m.id === models.defaultModel)) {
+      warnings.push(`config.models.defaultModel "${models.defaultModel}" is not in the current model catalog; it will fall back to a default at runtime.`);
     }
     
     if (!models.defaultTier || !['premium', 'standard', 'fast'].includes(models.defaultTier)) {
       errors.push('config.models.defaultTier must be "premium", "standard", or "fast"');
+    }
+    
+    // Validate cost policy if present (cost-ceiling axis, issue #1080/#1183)
+    if (models.costPolicy !== undefined) {
+      if (typeof models.costPolicy !== 'object' || models.costPolicy === null) {
+        errors.push('config.models.costPolicy must be an object');
+      } else if (
+        models.costPolicy.maxCategory !== undefined &&
+        !['lightweight', 'versatile', 'powerful'].includes(models.costPolicy.maxCategory)
+      ) {
+        errors.push(
+          'config.models.costPolicy.maxCategory must be "lightweight", "versatile", or "powerful"',
+        );
+      }
     }
     
     if (!models.fallbackChains) {
@@ -793,9 +820,9 @@ export function loadConfigSync(cwd: string = process.cwd()): ConfigLoadResult {
   
   // Only check squad.config.json (sync loading of .ts not supported)
   const jsonConfigPath = join(resolvedCwd, 'squad.config.json');
-  if (existsSync(jsonConfigPath)) {
+  if (storage.existsSync(jsonConfigPath)) {
     try {
-      const content = readFileSync(jsonConfigPath, 'utf-8');
+      const content = storage.readSync(jsonConfigPath) ?? '';
       const config = JSON.parse(content);
       const validated = validateConfig(config);
       

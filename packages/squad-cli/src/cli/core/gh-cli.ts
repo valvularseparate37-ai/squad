@@ -59,12 +59,17 @@ export async function ghAvailable(): Promise<boolean> {
 }
 
 /**
- * Check if gh CLI is authenticated
+ * Check if gh CLI is authenticated.
+ *
+ * Uses `gh auth token` instead of `gh auth status` because the latter
+ * returns a non-zero exit code when ANY account in the keyring has an
+ * invalid token — even if the active account (e.g. via GH_TOKEN) is
+ * perfectly fine.  `gh auth token` only checks the active account.
  */
 export async function ghAuthenticated(): Promise<boolean> {
   try {
-    await execFileAsync('gh', ['auth', 'status']);
-    return true;
+    const { stdout } = await execFileAsync('gh', ['auth', 'token']);
+    return stdout.trim().length > 0;
   } catch {
     return false;
   }
@@ -153,12 +158,13 @@ export async function ghRateLimitCheck(): Promise<GhRateLimit> {
 }
 
 /**
- * Detect if an error is a GitHub 429 rate limit error.
+ * Detect if an error is a GitHub rate-limit error (429 or explicit rate-limit messages).
+ * Does NOT match bare 403 — that indicates an auth/permissions error, not a transient rate limit.
  */
 export function isRateLimitError(err: unknown): boolean {
   if (err instanceof Error) {
     const msg = err.message.toLowerCase();
-    return msg.includes('rate limit') || msg.includes('secondary rate') || msg.includes('403');
+    return msg.includes('rate limit') || msg.includes('secondary rate') || msg.includes('429');
   }
   return false;
 }

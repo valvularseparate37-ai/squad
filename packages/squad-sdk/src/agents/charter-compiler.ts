@@ -9,6 +9,13 @@
 import { SquadCustomAgentConfig } from '../adapter/types.js';
 import { ConfigurationError } from '../adapter/errors.js';
 import { normalizeEol } from '../utils/normalize-eol.js';
+import { VALID_REASONING_EFFORTS, VALID_CONTEXT_TIERS } from '../config/models.js';
+
+/** Set form for fast lookup. */
+const VALID_EFFORTS = new Set<string>(VALID_REASONING_EFFORTS);
+
+/** Set form for fast lookup. */
+const VALID_TIERS = new Set<string>(VALID_CONTEXT_TIERS);
 
 /**
  * Options for compiling a charter.
@@ -26,6 +33,8 @@ export interface CharterCompileOptions {
   routingRules?: string;
   /** Relevant decision records */
   decisions?: string;
+  /** Enabled plugin guidance and metadata to inject into spawned-agent context */
+  pluginContext?: string;
   /** Config-driven overrides (config wins on conflict) */
   configOverrides?: CharterConfigOverrides;
 }
@@ -41,6 +50,10 @@ export interface CharterConfigOverrides {
   role?: string;
   /** Override or set model */
   model?: string;
+  /** Override or set reasoning effort level */
+  reasoningEffort?: string;
+  /** Override or set context tier (context window size) */
+  contextTier?: string;
   /** Override or set tools list */
   tools?: string[];
   /** Override or set status */
@@ -70,6 +83,10 @@ export interface ParsedCharter {
   modelRationale?: string;
   /** Fallback model from ## Model section */
   modelFallback?: string;
+  /** Reasoning effort preference from ## Model section */
+  reasoningEffort?: string;
+  /** Context tier preference from ## Model section */
+  contextTier?: string;
   /** Collaboration section content */
   collaboration?: string;
   /** Full charter content */
@@ -82,6 +99,10 @@ export interface ParsedCharter {
 export interface CompiledCharter extends SquadCustomAgentConfig {
   /** Resolved model (from config override or charter preference) */
   resolvedModel?: string;
+  /** Resolved reasoning effort (from config override or charter preference) */
+  resolvedReasoningEffort?: string;
+  /** Resolved context tier (from config override or charter preference) */
+  resolvedContextTier?: string;
   /** Resolved tools list (from config override or charter) */
   resolvedTools?: string[];
   /** Parsed charter data */
@@ -107,7 +128,7 @@ export function compileCharter(options: CharterCompileOptions): SquadCustomAgent
  * @throws {ConfigurationError} If charter is missing or malformed
  */
 export function compileCharterFull(options: CharterCompileOptions): CompiledCharter {
-  const { agentName, charterPath, charterContent, teamContext, routingRules, decisions, configOverrides } = options;
+  const { agentName, charterPath, charterContent, teamContext, routingRules, decisions, pluginContext, configOverrides } = options;
 
   try {
     const parsed = parseCharterMarkdown(charterContent ?? '');
@@ -133,6 +154,12 @@ export function compileCharterFull(options: CharterCompileOptions): CompiledChar
       promptParts.push('\n\n## Relevant Decisions\n\n' + decisions);
     }
 
+    // Add enabled plugin guidance after built-in squad context. Plugins are
+    // declarative/static only; this section is the runtime consumption point.
+    if (pluginContext) {
+      promptParts.push('\n\n## Plugin Context\n\n' + pluginContext);
+    }
+
     // Append extra prompt from config overrides
     if (configOverrides?.extraPrompt) {
       promptParts.push('\n\n' + configOverrides.extraPrompt);
@@ -152,6 +179,20 @@ export function compileCharterFull(options: CharterCompileOptions): CompiledChar
     // Resolve model: config override > charter preference
     const resolvedModel = configOverrides?.model || parsed.modelPreference;
 
+    // Resolve reasoning effort: config override > charter preference
+    // Normalize: "auto" and invalid values resolve to undefined
+    const configEffort = configOverrides?.reasoningEffort?.toLowerCase();
+    const charterEffort = parsed.reasoningEffort; // already validated during parsing
+    const validConfigEffort = configEffort && configEffort !== 'auto' && VALID_EFFORTS.has(configEffort) ? configEffort : undefined;
+    const resolvedReasoningEffort = validConfigEffort || charterEffort;
+
+    // Resolve context tier: config override > charter preference
+    // Normalize: "auto" and invalid values resolve to undefined
+    const configTier = configOverrides?.contextTier?.toLowerCase();
+    const charterTier = parsed.contextTier; // already validated during parsing
+    const validConfigTier = configTier && configTier !== 'auto' && VALID_TIERS.has(configTier) ? configTier : undefined;
+    const resolvedContextTier = validConfigTier || charterTier;
+
     // Resolve tools: config override > charter-extracted tools
     const resolvedTools = configOverrides?.tools;
     
@@ -163,6 +204,8 @@ export function compileCharterFull(options: CharterCompileOptions): CompiledChar
       infer: true,
       tools: resolvedTools ?? null,
       resolvedModel,
+      resolvedReasoningEffort,
+      resolvedContextTier,
       resolvedTools,
       parsed,
     };
@@ -221,6 +264,17 @@ export function parseCharterMarkdown(content: string): ParsedCharter {
     const styleMatch = identityContent.match(/\*\*Style:\*\*\s*(.+)/i);
     if (styleMatch) result.identity.style = styleMatch[1]!.trim();
   }
+
+  // Legacy charters identify the agent in the H1 instead of an Identity section.
+  if (!result.identity.name || !result.identity.role) {
+    const titleMatch = content.match(
+      /^#\s+(.+?)\s+(?:—|–|-)\s+(.+?)\s*$/m,
+    );
+    if (titleMatch) {
+      result.identity.name ??= titleMatch[1]!.trim();
+      result.identity.role ??= titleMatch[2]!.trim();
+    }
+  }
   
   // Extract ## What I Own section
   const ownershipMatch = content.match(/##\s+What I Own\s*\n([\s\S]*?)(?=\n##|\n---|$)/i);
@@ -249,6 +303,34 @@ export function parseCharterMarkdown(content: string): ParsedCharter {
     const fallbackMatch = modelContent.match(/\*\*Fallback:\*\*\s*(.+)/i);
     if (fallbackMatch) {
       result.modelFallback = fallbackMatch[1]!.trim();
+    }
+    const effortMatch = modelContent.match(/\*\*Reasoning Effort:\*\*\s*(.+)/i);
+    if (effortMatch) {
+      const raw = effortMatch[1]!.trim().toLowerCase();
+      // Normalize: "auto" → undefined, invalid values → undefined
+      if (raw !== 'auto' && VALID_EFFORTS.has(raw)) {
+        result.reasoningEffort = raw;
+      } else if (raw !== 'auto') {
+        // Surface invalid charter input to the author instead of dropping it silently.
+        console.warn(
+          `[squad] charter parse: ignoring invalid reasoning effort "${raw}" `
+          + `(expected ${VALID_REASONING_EFFORTS.join(', ')}, or auto)`,
+        );
+      }
+    }
+    const tierMatch = modelContent.match(/\*\*Context Tier:\*\*\s*(.+)/i);
+    if (tierMatch) {
+      const raw = tierMatch[1]!.trim().toLowerCase();
+      // Normalize: "auto" → undefined, invalid values → undefined
+      if (raw !== 'auto' && VALID_TIERS.has(raw)) {
+        result.contextTier = raw;
+      } else if (raw !== 'auto') {
+        // Surface invalid charter input to the author instead of dropping it silently.
+        console.warn(
+          `[squad] charter parse: ignoring invalid context tier "${raw}" `
+          + `(expected ${VALID_CONTEXT_TIERS.join(', ')}, or auto)`,
+        );
+      }
     }
   }
   

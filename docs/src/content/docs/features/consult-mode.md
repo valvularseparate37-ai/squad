@@ -9,7 +9,7 @@ Consult mode lets you bring your personal squad to projects you don't own — OS
 
 ## The Problem
 
-You have a personal squad at your global path (e.g., `~/.config/squad/.squad` on Linux) with agents, skills, and decisions refined over time. When you contribute to someone else's project, you face a dilemma:
+You have a personal squad at your global path (e.g., `~/Library/Application Support/squad/personal-squad` on macOS, `~/.config/squad/personal-squad` on Linux) with agents, skills, and decisions refined over time. When you contribute to someone else's project, you face a dilemma:
 
 - **Pollute the project?** Running `squad init` creates a `.squad/` folder they didn't ask for
 - **Pollute your squad?** Project-specific knowledge bleeds into your global squad
@@ -258,6 +258,6 @@ All consultations are tracked in your personal squad at `consultations/{project}
 
 ## Next Steps
 
-- **Set up a personal squad:** See [Your Personal Squad](../guide/personal-squad.md) for initial setup with `squad init --global`
+- **Set up a personal squad:** See [Team Setup](../features/team-setup.md) for initial setup with `squad init --global`
 - **Learn about sharing:** See [Export & Import](./export-import.md) for portable team snapshots
 - **Upstream inheritance:** See [Upstream Inheritance](./upstream-inheritance.md) for knowledge sharing across teams

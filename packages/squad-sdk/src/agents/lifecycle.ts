@@ -8,12 +8,17 @@
  */
 
 import { SquadClientWithPool } from '../client/index.js';
-import type { SquadSession, SquadSessionConfig } from '../adapter/types.js';
-import { compileCharter, type CharterCompileOptions } from './charter-compiler.js';
+import type { SquadSession, SquadSessionConfig, SquadReasoningEffort, SquadContextTier } from '../adapter/types.js';
+import { compileCharterFull, type CharterCompileOptions } from './charter-compiler.js';
 import { resolveModel, type ModelResolutionOptions, type TaskType } from './model-selector.js';
+import { VALID_REASONING_EFFORTS, VALID_CONTEXT_TIERS } from '../config/models.js';
+import type { CostPolicyConfig, SessionCostPolicyOverride } from '../config/models.js';
+import type { EventBus } from '../runtime/event-bus.js';
 import { ConfigurationError, SessionLifecycleError } from '../adapter/errors.js';
-import * as fs from 'fs/promises';
 import * as path from 'path';
+import { FSStorageProvider } from '../storage/fs-storage-provider.js';
+import type { StorageProvider } from '../storage/storage-provider.js';
+import { buildActivePluginContext } from '../marketplace/plugin-state.js';
 import { trace, SpanStatusCode } from '../runtime/otel-api.js';
 import { recordAgentSpawn, recordAgentDestroy, recordAgentError } from '../runtime/otel-metrics.js';
 
@@ -70,6 +75,18 @@ export interface SpawnAgentOptions {
   
   /** User-specified model override */
   modelOverride?: string;
+
+  /** User-specified reasoning effort override */
+  reasoningEffortOverride?: SquadReasoningEffort;
+
+  /** User-specified context tier override */
+  contextTierOverride?: SquadContextTier;
+  
+  /**
+   * Per-session cost-policy override (cost-ceiling axis, issue #1080/#1183).
+   * Takes precedence over the manager's persistent {@link LifecycleManagerConfig.costPolicy}.
+   */
+  sessionCostPolicy?: SessionCostPolicyOverride;
   
   /** Team context content (team.md) */
   teamContext?: string;
@@ -94,8 +111,23 @@ export interface LifecycleManagerConfig {
   /** Path to team root directory */
   teamRoot: string;
   
+  /** Storage provider for file I/O (default: FSStorageProvider) */
+  storage?: StorageProvider;
+  
   /** Default idle timeout (default: 5 minutes) */
   defaultIdleTimeout?: number;
+  
+  /**
+   * Persistent cost policy applied to all spawns (cost-ceiling axis).
+   * Overridable per-spawn via {@link SpawnAgentOptions.sessionCostPolicy}.
+   */
+  costPolicy?: CostPolicyConfig;
+  
+  /**
+   * Optional event bus used to surface cost-policy actions
+   * (downgrades / warnings). When absent, warnings still go to console.
+   */
+  eventBus?: EventBus;
 }
 
 /**
@@ -107,14 +139,20 @@ export interface LifecycleManagerConfig {
 export class AgentLifecycleManager {
   private client: SquadClientWithPool;
   private teamRoot: string;
+  private storage: StorageProvider;
   private defaultIdleTimeout: number;
+  private costPolicy?: CostPolicyConfig;
+  private eventBus?: EventBus;
   private agents: Map<string, AgentHandleImpl> = new Map();
   private idleCheckTimer: NodeJS.Timeout | null = null;
   
   constructor(config: LifecycleManagerConfig) {
     this.client = config.client;
     this.teamRoot = config.teamRoot;
+    this.storage = config.storage ?? new FSStorageProvider();
     this.defaultIdleTimeout = config.defaultIdleTimeout ?? 300_000; // 5 minutes
+    this.costPolicy = config.costPolicy;
+    this.eventBus = config.eventBus;
     
     // Start idle timeout checker
     this.startIdleChecker();
@@ -143,6 +181,9 @@ export class AgentLifecycleManager {
       task,
       taskType = 'code',
       modelOverride,
+      reasoningEffortOverride,
+      contextTierOverride,
+      sessionCostPolicy,
       teamContext,
       routingRules,
       decisions,
@@ -151,12 +192,16 @@ export class AgentLifecycleManager {
     
     try {
       // Step 1: Read charter.md
-      const charterPath = path.join(this.teamRoot, '.ai-team', 'agents', agentName, 'charter.md');
-      let charterContent: string;
-      
-      try {
-        charterContent = await fs.readFile(charterPath, 'utf-8');
-      } catch (error) {
+      const squadCharterPath = path.join(this.teamRoot, '.squad', 'agents', agentName, 'charter.md');
+      const legacyCharterPath = path.join(this.teamRoot, '.ai-team', 'agents', agentName, 'charter.md');
+      let charterPath = squadCharterPath;
+      let charterContent = await this.storage.read(charterPath);
+      if (charterContent === undefined) {
+        charterPath = legacyCharterPath;
+        charterContent = await this.storage.read(charterPath);
+      }
+
+      if (charterContent === undefined) {
         throw new ConfigurationError(
           `Charter not found for agent '${agentName}' at ${charterPath}`,
           {
@@ -164,8 +209,7 @@ export class AgentLifecycleManager {
             operation: 'spawnAgent',
             timestamp: new Date(),
             metadata: { charterPath },
-          },
-          error instanceof Error ? error : undefined
+          }
         );
       }
       
@@ -173,31 +217,59 @@ export class AgentLifecycleManager {
       const compileOptions: CharterCompileOptions = {
         agentName,
         charterPath,
+        charterContent,
         teamContext,
         routingRules,
         decisions,
+        pluginContext: await buildActivePluginContext(this.storage, path.join(this.teamRoot, '.squad')),
       };
       
-      const agentConfig = compileCharter(compileOptions);
+      const agentConfig = compileCharterFull(compileOptions);
       
-      // Step 3: Resolve model
+      // Step 3: Resolve model (with cost-policy finalization, issue #1080/#1183)
       const modelOptions: ModelResolutionOptions = {
         userOverride: modelOverride,
-        charterPreference: agentConfig.prompt.includes('## Model') 
-          ? this.extractModelPreference(charterContent)
-          : undefined,
+        charterPreference: agentConfig.resolvedModel !== undefined
+          ? agentConfig.resolvedModel
+          : this.extractModelPreference(charterContent),
         taskType,
         agentRole: agentName,
+        config: this.costPolicy ? { costPolicy: this.costPolicy } : undefined,
+        sessionCostPolicy,
       };
       
       const resolvedModel = resolveModel(modelOptions);
       
+      // Surface the cost-policy outcome — this was the #1089 bug: the policy
+      // result was computed but never wired/emitted. Never swallow it.
+      if (resolvedModel.policy && resolvedModel.policy.action !== 'none') {
+        await this.emitPolicyOutcome(agentName, resolvedModel);
+      }
+      
       // Step 4: Create session
+      // Use compiled charter's resolved reasoning effort (already validated/normalized),
+      // with spawn-time override taking precedence. Validate before passing to session.
+      const rawEffort = reasoningEffortOverride
+        || agentConfig.resolvedReasoningEffort
+        || undefined;
+      const validEffort = rawEffort && rawEffort !== 'auto' && (VALID_REASONING_EFFORTS as readonly string[]).includes(rawEffort)
+        ? rawEffort as SquadReasoningEffort
+        : undefined;
+      // Use compiled charter's resolved context tier (already validated/normalized),
+      // with spawn-time override taking precedence. Validate before passing to session.
+      const rawTier = contextTierOverride
+        || agentConfig.resolvedContextTier
+        || undefined;
+      const validTier = rawTier && rawTier !== 'auto' && (VALID_CONTEXT_TIERS as readonly string[]).includes(rawTier)
+        ? rawTier as SquadContextTier
+        : undefined;
       const sessionConfig: SquadSessionConfig = {
         model: resolvedModel.model,
         systemMessage: {
           content: agentConfig.prompt,
         },
+        ...(validEffort ? { reasoningEffort: validEffort } : {}),
+        ...(validTier ? { contextTier: validTier } : {}),
       };
       
       const session = await this.client.createSession(sessionConfig);
@@ -326,6 +398,41 @@ export class AgentLifecycleManager {
   private extractModelPreference(charterContent: string): string | undefined {
     const modelMatch = charterContent.match(/##\s+Model\s*\n[\s\S]*?\*\*Preferred:\*\*\s*(.+)/i);
     return modelMatch ? modelMatch[1]!.trim() : undefined;
+  }
+
+  /**
+   * Surface a cost-policy outcome (downgrade / warn-allow / fail-closed).
+   *
+   * Emits an `agent:milestone` event (`event: 'model.policy'`) on the bus when
+   * present, and always logs any human-readable warning via console.warn so the
+   * signal is never silently dropped (the #1089 defect this fix addresses).
+   * @private
+   */
+  private async emitPolicyOutcome(
+    agentName: string,
+    resolved: import('./model-selector.js').ResolvedModel,
+  ): Promise<void> {
+    const outcome = resolved.policy;
+    if (!outcome) return;
+
+    if (outcome.warning) {
+      console.warn(`[squad:cost-policy] ${agentName}: ${outcome.warning}`);
+    }
+
+    if (this.eventBus) {
+      await this.eventBus.emit({
+        type: 'agent:milestone',
+        agentName,
+        payload: {
+          event: 'model.policy',
+          action: outcome.action,
+          originalModel: outcome.originalModel,
+          finalModel: outcome.finalModel,
+          warning: outcome.warning,
+        },
+        timestamp: new Date(),
+      });
+    }
   }
 }
 

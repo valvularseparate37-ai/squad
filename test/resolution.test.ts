@@ -7,7 +7,7 @@ import { mkdirSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { tmpdir } from 'node:os';
-import { resolveSquad, resolveGlobalSquadPath, ensureSquadPath, ensurePersonalSquadDir } from '@bradygaster/squad-sdk/resolution';
+import { resolveSquad, resolveGlobalSquadPath, ensureSquadPath, ensurePersonalSquadDir, clearResolveSquadCache } from '@bradygaster/squad-sdk/resolution';
 
 const TMP = join(process.cwd(), `.test-resolution-${randomBytes(4).toString('hex')}`);
 
@@ -19,11 +19,13 @@ function scaffold(...dirs: string[]): void {
 
 describe('resolveSquad()', () => {
   beforeEach(() => {
+    clearResolveSquadCache();
     if (existsSync(TMP)) rmSync(TMP, { recursive: true, force: true });
     mkdirSync(TMP, { recursive: true });
   });
 
   afterEach(() => {
+    clearResolveSquadCache();
     if (existsSync(TMP)) rmSync(TMP, { recursive: true, force: true });
   });
 
@@ -221,7 +223,7 @@ describe('ensurePersonalSquadDir()', () => {
     const configPath = join(dir, 'config.json');
 
     // Write custom config
-    const custom = { defaultModel: 'gpt-4', ghostProtocol: true, custom: true };
+    const custom = { defaultModel: 'test-model', ghostProtocol: true, custom: true };
     require('node:fs').writeFileSync(configPath, JSON.stringify(custom), 'utf-8');
 
     // Call again — should not overwrite
@@ -230,7 +232,7 @@ describe('ensurePersonalSquadDir()', () => {
       require('node:fs').readFileSync(configPath, 'utf-8'),
     );
     expect(config.custom).toBe(true);
-    expect(config.defaultModel).toBe('gpt-4');
+    expect(config.defaultModel).toBe('test-model');
   });
 
   it('returns path inside resolveGlobalSquadPath()', () => {

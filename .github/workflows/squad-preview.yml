@@ -4,6 +4,10 @@ on:
   push:
     branches: [preview]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -11,9 +15,9 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 #v6
         with:
           node-version: 22
 
@@ -27,7 +31,7 @@ jobs:
           echo "✅ Version $VERSION validated in CHANGELOG.md"
 
       - name: Run tests
-        run: node --test test/*.test.js
+        run: node --test test/*.test.cjs
 
       - name: Check no .ai-team/ or .squad/ files are tracked
         run: |

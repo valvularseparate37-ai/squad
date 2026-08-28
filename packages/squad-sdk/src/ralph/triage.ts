@@ -1,4 +1,7 @@
 import { normalizeEol } from '../utils/normalize-eol.js';
+import { slugify } from '../utils/slugify.js';
+
+export { slugify } from '../utils/slugify.js';
 
 /** Parsed routing rule from routing.md */
 export interface RoutingRule {
@@ -106,7 +109,7 @@ export function parseRoster(teamMd: string): TeamMember[] {
   const roleIndex = findColumnIndex(table.headers, ['role']);
   if (nameIndex < 0 || roleIndex < 0) return [];
 
-  const excluded = new Set(['scribe', 'ralph']);
+  const excluded = new Set(['scribe', 'ralph', 'Rai']);
   const members: TeamMember[] = [];
 
   for (const row of table.rows) {
@@ -118,11 +121,36 @@ export function parseRoster(teamMd: string): TeamMember[] {
     members.push({
       name,
       role,
-      label: `squad:${name.toLowerCase()}`,
+      label: `squad:${slugify(name)}`,
     });
   }
 
   return members;
+}
+
+/**
+ * Normalize an agent/role reference for comparison — strips markdown, emoji,
+ * and casing so `EECOM 🔧` and `eecom` compare equal.
+ *
+ * Exported so other modules (e.g. capability advertisement) reuse the exact
+ * matching semantics triage uses, instead of re-implementing them.
+ *
+ * @param value - Raw cell or name text.
+ * @returns Normalized comparison key.
+ */
+export function normalizeAgentName(value: string): string {
+  return normalizeName(value);
+}
+
+/**
+ * Resolve a routing-table agent reference to a current roster member.
+ *
+ * @param target - Agent reference from routing.md (may carry emoji/markdown).
+ * @param roster - Current roster from {@link parseRoster}.
+ * @returns The matching member, or `null` when the reference is stale.
+ */
+export function findRosterMember(target: string, roster: TeamMember[]): TeamMember | null {
+  return findMember(target, roster);
 }
 
 /**

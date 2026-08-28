@@ -8,8 +8,10 @@
  */
 
 import { join } from 'node:path';
-import { existsSync, readFileSync } from 'node:fs';
+import { FSStorageProvider } from '@bradygaster/squad-sdk';
 import { writeEconomyMode, readEconomyMode } from '@bradygaster/squad-sdk/config';
+
+const storage = new FSStorageProvider();
 import { fatal } from '../core/errors.js';
 import { BOLD, RESET, GREEN, DIM } from '../core/output.js';
 
@@ -18,7 +20,7 @@ function resolveSquadDir(cwd: string): string | null {
   let dir = cwd;
   for (let i = 0; i < 10; i++) {
     const candidate = join(dir, '.squad');
-    if (existsSync(candidate)) {
+    if (storage.existsSync(candidate)) {
       return candidate;
     }
     const parent = join(dir, '..');
@@ -59,8 +61,9 @@ export async function runEconomy(cwd: string, subArgs: string[]): Promise<void> 
   if (enabled) {
     console.log(`  When active, auto-selected models are downgraded:`);
     console.log(`    ${DIM}claude-opus-4.6   → claude-sonnet-4.5  (architecture/review)${RESET}`);
-    console.log(`    ${DIM}claude-sonnet-4.6 → gpt-4.1            (code writing)${RESET}`);
-    console.log(`    ${DIM}claude-haiku-4.5  → gpt-4.1            (docs/mechanical)${RESET}`);
+    console.log(`    ${DIM}gpt-5.6-sol       → gpt-5.6-terra       (premium auto-selection)${RESET}`);
+    console.log(`    ${DIM}gpt-5.6-terra     → gpt-5.6-luna        (code writing)${RESET}`);
+    console.log(`    ${DIM}claude-haiku-4.5  → gpt-5.6-luna        (docs/mechanical)${RESET}`);
     console.log(`  Explicit overrides (config.json, charter) are never changed.\n`);
   } else {
     console.log(`  Usage: squad economy on | off\n`);

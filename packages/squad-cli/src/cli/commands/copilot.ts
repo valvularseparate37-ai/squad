@@ -3,10 +3,12 @@
  * Port from beta index.js lines 598-713
  */
 
-import fs from 'node:fs';
 import path from 'node:path';
+import { FSStorageProvider } from '@bradygaster/squad-sdk';
+
+const storage = new FSStorageProvider();
 import { success, dim, bold, info, BOLD, RESET, DIM } from '../core/output.js';
-import { detectSquadDir } from '../core/detect-squad-dir.js';
+import { effectiveSquadDir } from '../core/effective-squad-dir.js';
 import {
   readTeamMd,
   writeTeamMd,
@@ -25,15 +27,15 @@ export interface CopilotFlags {
  * Run copilot command
  */
 export async function runCopilot(dest: string, flags: CopilotFlags): Promise<void> {
-  const squadDirInfo = detectSquadDir(dest);
-  const squadDir = squadDirInfo.path;
+  // Roster lives in the effective state dir when state is externalized (#1397)
+  const { stateDir } = effectiveSquadDir(dest);
 
-  // Ensure squad directory exists
-  if (!fs.existsSync(squadDir)) {
+  // Ensure squad state exists
+  if (!storage.existsSync(stateDir)) {
     throw new Error('No squad found — run init first, then add the copilot agent.');
   }
 
-  let content = readTeamMd(squadDir);
+  let content = readTeamMd(stateDir);
   const copilotExists = hasCopilot(content);
 
   // Remove copilot
@@ -45,13 +47,13 @@ export async function runCopilot(dest: string, flags: CopilotFlags): Promise<voi
     
     // Remove the Coding Agent section
     content = removeCopilotSection(content);
-    writeTeamMd(squadDir, content);
+    writeTeamMd(stateDir, content);
     success('Removed @copilot from the team roster');
 
     // Remove copilot-instructions.md
     const instructionsDest = path.join(dest, '.github', 'copilot-instructions.md');
-    if (fs.existsSync(instructionsDest)) {
-      fs.unlinkSync(instructionsDest);
+    if (storage.existsSync(instructionsDest)) {
+      storage.deleteSync(instructionsDest);
       success('Removed .github/copilot-instructions.md');
     }
     return;
@@ -61,7 +63,7 @@ export async function runCopilot(dest: string, flags: CopilotFlags): Promise<voi
   if (copilotExists) {
     if (flags.autoAssign) {
       content = setAutoAssign(content, true);
-      writeTeamMd(squadDir, content);
+      writeTeamMd(stateDir, content);
       success('Enabled @copilot auto-assign');
     } else {
       console.log(`${DIM}@copilot is already on the team${RESET}`);
@@ -71,7 +73,7 @@ export async function runCopilot(dest: string, flags: CopilotFlags): Promise<voi
 
   // Add copilot
   content = insertCopilotSection(content, flags.autoAssign);
-  writeTeamMd(squadDir, content);
+  writeTeamMd(stateDir, content);
   success('Added @copilot (Coding Agent) to team roster');
   
   if (flags.autoAssign) {
@@ -88,9 +90,9 @@ export async function runCopilot(dest: string, flags: CopilotFlags): Promise<voi
   const instructionsSrc = path.join(templatesSrc, 'copilot-instructions.md');
   const instructionsDest = path.join(dest, '.github', 'copilot-instructions.md');
   
-  if (fs.existsSync(instructionsSrc)) {
-    fs.mkdirSync(path.dirname(instructionsDest), { recursive: true });
-    fs.copyFileSync(instructionsSrc, instructionsDest);
+  if (storage.existsSync(instructionsSrc)) {
+    storage.mkdirSync(path.dirname(instructionsDest), { recursive: true });
+    storage.copySync(instructionsSrc, instructionsDest);
     success('.github/copilot-instructions.md');
   }
 

@@ -8,6 +8,10 @@ on:
         description: 'Version to publish (e.g., 0.9.1)'
         required: true
         type: string
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
 permissions:
   contents: read
   id-token: write
@@ -15,8 +19,9 @@ jobs:
   preflight:
     name: Pre-publish dependency validation
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7
         with:
           fetch-depth: 0
       - name: "Scan for file: references in package.json files"
@@ -50,6 +55,41 @@ jobs:
             exit 1
           fi
           echo "✅ No file: references found — safe to publish"
+      # CI Hardening: Lockfile stability check (item 6)
+      # Ensures workspace packages in package-lock.json resolve to local links,
+      # not stale registry URLs. Catches lockfile drift before publish —
+      # prevents v0.9.1-style incidents where stale entries break installs.
+      - name: "🔒 Lockfile stability check"
+        run: |
+          echo "Validating package-lock.json hasn't drifted..."
+          node -e "
+            const fs = require('fs');
+            const lock = JSON.parse(fs.readFileSync('package-lock.json', 'utf8'));
+            const pkgs = lock.packages || {};
+            const stale = Object.keys(pkgs).filter(k =>
+              k.includes('node_modules/@bradygaster/squad-') &&
+              pkgs[k].resolved && pkgs[k].resolved.startsWith('https://')
+            );
+            if (stale.length) {
+              console.error('::error::LOCKFILE DRIFT DETECTED — workspace packages resolve to registry URLs instead of local links.');
+              stale.forEach(k => console.error('  STALE: ' + k + ' → ' + pkgs[k].resolved));
+              console.error('');
+              console.error('Fix: Run npm install at the repo root to regenerate the lockfile.');
+              process.exit(1);
+            }
+            const missingIntegrity = Object.keys(pkgs).filter(k =>
+              k.includes('node_modules/@bradygaster/squad-') &&
+              pkgs[k].resolved && pkgs[k].resolved.startsWith('https://') &&
+              (!pkgs[k].integrity || !pkgs[k].integrity.startsWith('sha512-'))
+            );
+            if (missingIntegrity.length) {
+              console.error('::error::MISSING INTEGRITY HASHES — workspace packages resolved from registry lack sha512 hashes:');
+              missingIntegrity.forEach(k => console.error('  ' + k + ' (resolved: ' + pkgs[k].resolved + ')'));
+              console.error('Fix: Run npm install at the repo root to regenerate the lockfile.');
+              process.exit(1);
+            }
+            console.log('✅ Lockfile stable — all workspace packages resolve to local links');
+          "
       - name: Validate semver versions
         run: |
           echo "Validating version numbers are valid semver..."
@@ -77,15 +117,30 @@ jobs:
     name: CLI packaging smoke test
     needs: preflight
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 #v6
         with:
           node-version: 22
+          cache: 'npm'
       - name: Install dependencies
-        run: npm ci
+        run: |
+          success=false
+          for i in 1 2 3; do
+            if npm ci; then
+              success=true
+              break
+            fi
+            echo "Retry $i/3 — npm ci failed, retrying in 5s..."
+            sleep 5
+          done
+          if [ "$success" = false ]; then
+            echo "::error::npm ci failed after 3 attempts"
+            exit 1
+          fi
       - name: Build
         run: npm run build
         env:
@@ -98,18 +153,61 @@ jobs:
           echo "✅ Both packages pack successfully"
       - name: Run CLI smoke tests
         run: npx vitest run test/cli-packaging-smoke.test.ts
-  publish-sdk:
-    name: Publish @bradygaster/squad-sdk
+  # CI Hardening: npm registry health check (item 10)
+  # Verify the npm registry is reachable before starting any publish jobs.
+  # Prevents wasted CI time and partial publishes when the registry is down.
+  registry-check:
+    name: npm registry health check
     needs: [preflight, smoke-test]
     runs-on: ubuntu-latest
+    timeout-minutes: 3
     steps:
-      - uses: actions/checkout@v4
+      - name: "🌐 Verify npm registry is reachable"
+        run: |
+          echo "Checking npm registry health before publish..."
+          success=false
+          for i in 1 2 3; do
+            if npm ping 2>&1; then
+              success=true
+              break
+            fi
+            echo "Registry ping attempt $i/3 failed, retrying in 5s..."
+            sleep 5
+          done
+          if [ "$success" = false ]; then
+            echo "::error::npm registry is unreachable after 3 attempts — publish aborted"
+            echo "::error::Check https://status.npmjs.org/ for registry status"
+            exit 1
+          fi
+          echo "✅ npm registry is reachable"
+          if ! npm view @bradygaster/squad-sdk version 2>/dev/null; then
+            echo "::warning::Cannot verify @bradygaster/squad-sdk on registry — package may not exist yet or registry is degraded"
+          else
+            echo "✅ @bradygaster package namespace is accessible"
+          fi
+  publish-sdk:
+    name: Publish @bradygaster/squad-sdk
+    needs: [preflight, smoke-test, registry-check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 #v6
         with:
           node-version: 22
           registry-url: 'https://registry.npmjs.org'
+          cache: 'npm'
+      - name: Validate npm token
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::NPM_TOKEN secret is not configured — publish will fail"
+            exit 1
+          fi
+          echo "✅ NPM_TOKEN is set"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Determine version
         id: version
         run: |
@@ -122,7 +220,20 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Publishing version: ${VERSION}"
       - name: Install dependencies
-        run: npm ci
+        run: |
+          success=false
+          for i in 1 2 3; do
+            if npm ci; then
+              success=true
+              break
+            fi
+            echo "Retry $i/3 — npm ci failed, retrying in 5s..."
+            sleep 5
+          done
+          if [ "$success" = false ]; then
+            echo "::error::npm ci failed after 3 attempts"
+            exit 1
+          fi
       - name: Build squad-sdk
         run: npm -w packages/squad-sdk run build
       - name: Verify package version matches target
@@ -150,16 +261,31 @@ jobs:
           echo "Registry propagation slow but package was published successfully"
   publish-cli:
     name: Publish @bradygaster/squad-cli
-    needs: [preflight, smoke-test, publish-sdk]
+    needs: [preflight, smoke-test, registry-check, publish-sdk]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      # Consumed by `bump-activation-pin` so the pin moves to the version this run
+      # actually published, rather than to whatever npm happens to report later.
+      version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 #v6
         with:
           node-version: 22
           registry-url: 'https://registry.npmjs.org'
+          cache: 'npm'
+      - name: Validate npm token
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::NPM_TOKEN secret is not configured — publish will fail"
+            exit 1
+          fi
+          echo "✅ NPM_TOKEN is set"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Determine version
         id: version
         run: |
@@ -172,7 +298,20 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Publishing version: ${VERSION}"
       - name: Install dependencies
-        run: npm ci
+        run: |
+          success=false
+          for i in 1 2 3; do
+            if npm ci; then
+              success=true
+              break
+            fi
+            echo "Retry $i/3 — npm ci failed, retrying in 5s..."
+            sleep 5
+          done
+          if [ "$success" = false ]; then
+            echo "::error::npm ci failed after 3 attempts"
+            exit 1
+          fi
       - name: "Guard against file: dependencies"
         run: |
           SDK_DEP=$(node -p "require('./packages/squad-cli/package.json').dependencies['@bradygaster/squad-sdk']")
@@ -181,6 +320,48 @@ jobs:
             exit 1
           fi
           echo "SDK dependency is safe: $SDK_DEP"
+      - name: "Verify SDK version is resolvable on npm (#1203)"
+        run: |
+          # Extract the minimum version floor from the SDK dependency range
+          SDK_DEP=$(node -p "require('./packages/squad-cli/package.json').dependencies['@bradygaster/squad-sdk']")
+          echo "SDK dependency declared: $SDK_DEP"
+          # Verify that at least one version satisfying the range exists on the registry
+          if ! npm view "@bradygaster/squad-sdk" versions --json 2>/dev/null | node -e "
+            const semver = require('semver');
+            const range = process.argv[1];
+            let data = '';
+            process.stdin.on('data', c => data += c);
+            process.stdin.on('end', () => {
+              const versions = JSON.parse(data);
+              const arr = Array.isArray(versions) ? versions : [versions];
+              const match = arr.find(v => semver.satisfies(v, range));
+              if (!match) {
+                console.error('::error::No published SDK version satisfies ' + range);
+                process.exit(1);
+              }
+              console.log('✅ SDK dependency resolves to: ' + match);
+            });
+          " "$SDK_DEP"; then
+            echo "::error::Cannot verify SDK dependency is resolvable — aborting CLI publish to prevent #1203"
+            exit 1
+          fi
+      - name: "Pin squad-sdk dependency to the exact published version (#1588)"
+        run: |
+          # Source keeps a floor range (">=x.y.z") so local workspace installs
+          # still resolve the in-repo SDK. That range is unbounded upward
+          # though, so a CLI version pinned by a downstream consumer silently
+          # picks up whatever SDK version is newest at their install time.
+          # Rewrite the published package.json to an exact pin so a given CLI
+          # version always resolves the same SDK version it shipped with.
+          PKG_VERSION="${{ steps.version.outputs.version }}"
+          node -e "
+            const fs = require('fs');
+            const path = 'packages/squad-cli/package.json';
+            const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+            pkg.dependencies['@bradygaster/squad-sdk'] = '$PKG_VERSION';
+            fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+            console.log('Pinned @bradygaster/squad-sdk dependency to ' + '$PKG_VERSION');
+          "
       - name: Build squad-sdk (required for CLI project references)
         run: npm -w packages/squad-sdk run build
       - name: Build squad-cli
@@ -208,3 +389,216 @@ jobs:
             sleep 15
           done
           echo "Registry propagation slow but package was published successfully"
+
+  # --- Issue #1825 ------------------------------------------------------
+  # Release-time half of the activation-pin guard.
+  #
+  # The literal in `workflows/shared/squad.md` decides which Squad CLI a brand-new
+  # repository installs during activation. Nothing about publishing used to touch it,
+  # so every release silently made it stale — it once ran 8 days behind and was caught
+  # only because someone happened to cold-start a throwaway repo (PR #1818).
+  #
+  # `.github/workflows/squad-cli-pin-drift.yml` is the daily backstop that *detects*
+  # that state. This job is the half that prevents it, by moving the pin in the same
+  # run that made the new version installable. Both halves are load-bearing: detection
+  # alone leaves a red build with no fix path, and prevention alone re-breaks the
+  # moment someone publishes out-of-band.
+  bump-activation-pin:
+    name: Bump activation pin to the published release
+    needs: publish-cli
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7
+        with:
+          # The pin lives on the default branch, but releases are cut from `main`.
+          # Bumping a `main` checkout would edit a file `dev` never sees, and the next
+          # merge would quietly restore the stale value.
+          ref: dev
+          fetch-depth: 0
+
+      - name: Confirm the version is published and current
+        id: target
+        env:
+          TARGET: ${{ needs.publish-cli.outputs.version }}
+          NPM_PACKAGE: '@bradygaster/squad-cli'
+        run: |
+          set -euo pipefail
+
+          if [ -z "$TARGET" ]; then
+            echo "::error::publish-cli reported no version — refusing to guess which version to pin."
+            exit 1
+          fi
+
+          # Two independent sources, which is the whole point of #1825: the version this
+          # run published, and what npm now serves as `latest`. Checking only the repo
+          # would compare the pin against itself, and the repo's own manifest holds the
+          # next *unreleased* version — the E404 that PR #1818 had to fix by hand.
+          latest=""
+          for attempt in 1 2 3 4 5; do
+            latest="$(npm view "$NPM_PACKAGE" dist-tags.latest 2>/dev/null || true)"
+            if [ "$latest" = "$TARGET" ]; then
+              break
+            fi
+            echo "dist-tags.latest is '${latest:-<unset>}', waiting for '$TARGET' (attempt $attempt/5)..."
+            sleep 15
+          done
+
+          if [ "$latest" != "$TARGET" ]; then
+            echo "::error::npm dist-tags.latest is '${latest:-<unset>}', not the published '$TARGET'. Not moving the pin to a version new repositories would not receive."
+            exit 1
+          fi
+
+          echo "version=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "Confirmed $NPM_PACKAGE@$TARGET is the published latest."
+
+      - name: Rewrite the pin
+        id: bump
+        env:
+          TARGET_VERSION: ${{ steps.target.outputs.version }}
+          PR_BODY_FILE: ${{ runner.temp }}/activation-pin-pr.md
+        run: node scripts/bump-activation-pin.mjs
+
+      - name: Open pull request
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ steps.target.outputs.version }}
+          PR_BODY_FILE: ${{ runner.temp }}/activation-pin-pr.md
+        run: |
+          set -euo pipefail
+
+          # A pull request rather than a push: `dev` does not take direct pushes, and a
+          # version bump that lands unreviewed is exactly the kind of change that should
+          # be visible in history.
+          branch="chore/activation-pin-$TARGET"
+
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "Branch $branch already exists — an earlier run already opened this bump."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+
+          # Named explicitly: the checkout is a full release tree, and `git add -A` here
+          # would sweep in anything the publish jobs left behind.
+          git add workflows/shared/squad.md docs/src/content/docs/guide/gh-aw.md
+          git commit -m "chore: pin Squad CLI activation to $TARGET
+
+          Refs #1825"
+          git push origin "$branch"
+
+          gh pr create \
+            --base dev \
+            --head "$branch" \
+            --title "chore: pin Squad CLI activation to $TARGET" \
+            --body-file "$PR_BODY_FILE"
+
+  # --- Issues #1491 / #1497 ---------------------------------------------
+  # After a stable release publishes to `latest`, ensure each package's
+  # `insider` dist-tag is not left semver-lower than `latest`. Promotions run
+  # per package so a successful SDK publish can still update SDK's `insider`
+  # tag even when the later CLI publish fails.
+  promote-insider-tag-sdk:
+    name: Promote SDK insider dist-tag if behind latest
+    needs: publish-sdk
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 #v6
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+      - name: Validate npm token
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::NPM_TOKEN secret is not configured; cannot promote insider dist-tag"
+            exit 1
+          fi
+          echo "NPM_TOKEN is set"
+      - name: Determine and validate version
+        id: version
+        env:
+          # Read release-tag / dispatch inputs into env to avoid `${{ }}`
+          # interpolation inside a shell script (script-injection hardening).
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "release" ]; then
+            RAW="${RELEASE_TAG#v}"
+          else
+            RAW="$INPUT_VERSION"
+          fi
+          # Strict semver-only regex (defense in depth: script re-validates too).
+          if ! printf '%s' "$RAW" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::Invalid version format: $RAW"
+            exit 1
+          fi
+          echo "version=$RAW" >> "$GITHUB_OUTPUT"
+          echo "Promotion candidate: $RAW"
+      - name: Promote insider dist-tag for squad-sdk
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NEW_VERSION: ${{ steps.version.outputs.version }}
+        run: node scripts/promote-insider-tag.mjs @bradygaster/squad-sdk "$NEW_VERSION"
+  promote-insider-tag-cli:
+    name: Promote CLI insider dist-tag if behind latest
+    needs: publish-cli
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 #v6
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+      - name: Validate npm token
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::NPM_TOKEN secret is not configured; cannot promote insider dist-tag"
+            exit 1
+          fi
+          echo "NPM_TOKEN is set"
+      - name: Determine and validate version
+        id: version
+        env:
+          # Read release-tag / dispatch inputs into env to avoid `${{ }}`
+          # interpolation inside a shell script (script-injection hardening).
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "release" ]; then
+            RAW="${RELEASE_TAG#v}"
+          else
+            RAW="$INPUT_VERSION"
+          fi
+          # Strict semver-only regex (defense in depth: script re-validates too).
+          if ! printf '%s' "$RAW" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::Invalid version format: $RAW"
+            exit 1
+          fi
+          echo "version=$RAW" >> "$GITHUB_OUTPUT"
+          echo "Promotion candidate: $RAW"
+      - name: Promote insider dist-tag for squad-cli
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NEW_VERSION: ${{ steps.version.outputs.version }}
+        run: node scripts/promote-insider-tag.mjs @bradygaster/squad-cli "$NEW_VERSION"

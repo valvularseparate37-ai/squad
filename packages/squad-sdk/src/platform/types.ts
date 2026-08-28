@@ -23,6 +23,7 @@ export interface WorkItem {
   state: string;
   tags: string[];
   assignedTo?: string;
+  body?: string;
   url: string;
 }
 
@@ -49,6 +50,23 @@ export interface PlatformAdapter {
   addTag(workItemId: number, tag: string): Promise<void>;
   removeTag(workItemId: number, tag: string): Promise<void>;
   addComment(workItemId: number, comment: string): Promise<void>;
+  /**
+   * Assign a work item to a user. Pass undefined/empty to unassign the current assignee.
+   * '@me' assigns the current user on GitHub; the ADO adapter cannot resolve '@me' and skips it (no-op).
+   */
+  setAssignee(workItemId: number, assignee: string | undefined): Promise<void>;
+
+  /** Ensure a tag/label exists (creates it if missing). No-op on platforms with auto-created tags. */
+  ensureTag?(tag: string, options?: { color?: string; description?: string }): Promise<void>;
+
+  /**
+   * Verify and repair authentication context for the current repository.
+   * If preferredUser is provided, switch to that account directly.
+   * Otherwise, try to auto-detect from the remote URL (works for EMU repos
+   * where org name = account name, but not for repos where owner ≠ your account).
+   * No-op if auth is already correct. Non-fatal — never throws.
+   */
+  ensureAuth?(preferredUser?: string): Promise<void>;
 
   // Pull Requests
   listPullRequests(options: { status?: string; limit?: number }): Promise<PullRequest[]>;
@@ -67,7 +85,7 @@ export interface PlatformAdapter {
 // ─── Communication Adapter ────────────────────────────────────────────
 
 /** Where communication happens — which channel/service */
-export type CommunicationChannel = 'github-discussions' | 'ado-work-items' | 'teams-webhook' | 'file-log';
+export type CommunicationChannel = 'github-discussions' | 'ado-work-items' | 'teams-graph' | 'file-log';
 
 /** A reply from a human on a communication channel */
 export interface CommunicationReply {
@@ -87,6 +105,8 @@ export interface CommunicationConfig {
   postDecisions?: boolean;
   /** Post escalations when agents are blocked */
   postEscalations?: boolean;
+  /** Adapter-specific configuration, keyed by channel name */
+  adapterConfig?: Record<string, unknown>;
 }
 
 /**
@@ -126,4 +146,11 @@ export interface CommunicationAdapter {
    * Returns undefined if the channel has no web UI (e.g., file-log).
    */
   getNotificationUrl(threadId: string): string | undefined;
+
+  /**
+   * Logout: clear cached credentials for this adapter.
+   * Local credential purge — does not revoke server-side tokens.
+   * Optional — not all adapters require authentication.
+   */
+  logout?(): Promise<void>;
 }

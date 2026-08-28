@@ -1,0 +1,940 @@
+/**
+ * Watch Capabilities Tests — PR #709 coverage
+ *
+ * Tests the WatchCapability plugin classes: execute, cleanup,
+ * decision-hygiene, self-pull, and board. Mocks external dependencies
+ * (child_process, filesystem, SDK storage) to test pure logic.
+ *
+ * Prioritized by risk: execute > cleanup > decision-hygiene > self-pull > board.
+ */
+
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { WatchContext } from '../../packages/squad-cli/src/cli/commands/watch/types.js';
+
+// ── Shared mock state (hoisted alongside vi.mock) ───────────────────
+
+const {
+  mockStorage,
+  mockExecFile,
+  mockExecFileSync,
+  mockFsExistsSync,
+  mockRmSync,
+} = vi.hoisted(() => ({
+  mockStorage: {
+    existsSync: vi.fn(() => true),
+    listSync: vi.fn((): string[] => []),
+  },
+  mockExecFile: vi.fn((...args: unknown[]) => {
+    const cb = args.find(a => typeof a === 'function') as
+      | ((...cbArgs: unknown[]) => void)
+      | undefined;
+    if (cb) cb(null, '', '');
+    return {};
+  }),
+  mockExecFileSync: vi.fn((): string => ''),
+  mockFsExistsSync: vi.fn((): boolean => false),
+  mockRmSync: vi.fn(),
+}));
+
+// ── Module mocks ────────────────────────────────────────────────────
+
+vi.mock('@bradygaster/squad-sdk', () => ({
+  FSStorageProvider: vi.fn(function () { return mockStorage; }),
+}));
+
+vi.mock('node:child_process', () => ({
+  execFile: mockExecFile,
+  execFileSync: mockExecFileSync,
+}));
+
+vi.mock('node:fs', () => ({
+  existsSync: mockFsExistsSync,
+  rmSync: mockRmSync,
+}));
+
+// ── Imports (resolved against mocks) ────────────────────────────────
+
+import {
+  ExecuteCapability,
+  buildAgentPrompt,
+  findExecutableIssues,
+} from '../../packages/squad-cli/src/cli/commands/watch/capabilities/execute.js';
+import type { ExecutableWorkItem } from '../../packages/squad-cli/src/cli/commands/watch/capabilities/execute.js';
+import { CleanupCapability } from '../../packages/squad-cli/src/cli/commands/watch/capabilities/cleanup.js';
+import { DecisionHygieneCapability } from '../../packages/squad-cli/src/cli/commands/watch/capabilities/decision-hygiene.js';
+import { RetroCapability } from '../../packages/squad-cli/src/cli/commands/watch/capabilities/retro.js';
+import { BoardCapability } from '../../packages/squad-cli/src/cli/commands/watch/capabilities/board.js';
+import { SelfPullCapability } from '../../packages/squad-cli/src/cli/commands/watch/capabilities/self-pull.js';
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+function makeContext(overrides: Partial<WatchContext> = {}): WatchContext {
+  return {
+    teamRoot: '/fake/team',
+    stateRoot: '/fake/team/.squad',
+    adapter: {
+      listWorkItems: vi.fn().mockResolvedValue([]),
+    } as unknown as WatchContext['adapter'],
+    round: 1,
+    roster: [{ name: 'EECOM', label: 'squad:eecom', expertise: [] }],
+    config: {},
+    ...overrides,
+  };
+}
+
+function mockAdapter(items: Array<Record<string, unknown>>): WatchContext['adapter'] {
+  return {
+    listWorkItems: vi.fn().mockResolvedValue(items),
+  } as unknown as WatchContext['adapter'];
+}
+
+type CallbackFn = (...cbArgs: unknown[]) => void;
+
+function findCallback(args: unknown[]): CallbackFn | undefined {
+  return args.find(a => typeof a === 'function') as CallbackFn | undefined;
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+describe('Watch Capabilities', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockStorage.existsSync.mockReturnValue(true);
+    mockStorage.listSync.mockReturnValue([]);
+    mockFsExistsSync.mockReturnValue(false);
+    mockRmSync.mockReturnValue(undefined);
+    mockExecFile.mockImplementation((...args: unknown[]) => {
+      const cb = findCallback(args);
+      if (cb) cb(null, '', '');
+      return {};
+    });
+    mockExecFileSync.mockReturnValue('');
+  });
+
+  // ────────────────────────────────────────────────────────────────
+  // Metadata — verify every capability declares correct identity
+  // ────────────────────────────────────────────────────────────────
+
+  describe('Capability metadata', () => {
+    it('ExecuteCapability', () => {
+      const cap = new ExecuteCapability();
+      expect(cap.name).toBe('execute');
+      expect(cap.phase).toBe('post-execute');
+      expect(cap.requires).toContain('gh');
+      expect(cap.configShape).toBe('boolean');
+      expect(cap.description).toBeTruthy();
+    });
+
+    it('BoardCapability', () => {
+      const cap = new BoardCapability();
+      expect(cap.name).toBe('board');
+      expect(cap.phase).toBe('post-execute');
+      expect(cap.requires).toContain('gh');
+      expect(cap.configShape).toBe('object');
+    });
+
+    it('CleanupCapability', () => {
+      const cap = new CleanupCapability();
+      expect(cap.name).toBe('cleanup');
+      expect(cap.phase).toBe('housekeeping');
+      expect(cap.requires).toEqual([]);
+      expect(cap.configShape).toBe('object');
+    });
+
+    it('DecisionHygieneCapability', () => {
+      const cap = new DecisionHygieneCapability();
+      expect(cap.name).toBe('decision-hygiene');
+      expect(cap.phase).toBe('housekeeping');
+      expect(cap.requires).toContain('gh');
+      expect(cap.configShape).toBe('boolean');
+    });
+
+    it('SelfPullCapability', () => {
+      const cap = new SelfPullCapability();
+      expect(cap.name).toBe('self-pull');
+      expect(cap.phase).toBe('pre-scan');
+      expect(cap.requires).toContain('git');
+      expect(cap.configShape).toBe('boolean');
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────
+  // ExecuteCapability — highest risk, spawns external processes
+  // ────────────────────────────────────────────────────────────────
+
+  describe('ExecuteCapability', () => {
+    describe('buildAgentPrompt', () => {
+      it('includes issue numbers and titles', () => {
+        const issues: ExecutableWorkItem[] = [
+          { number: 1, title: 'Fix bug', labels: [{ name: 'squad:eecom' }], assignees: [] },
+          { number: 2, title: 'Add tests', labels: [{ name: 'squad' }], assignees: [] },
+        ];
+        const prompt = buildAgentPrompt(issues, '/fake/team');
+        expect(prompt).toContain('#1');
+        expect(prompt).toContain('#2');
+        expect(prompt).toContain('Fix bug');
+        expect(prompt).toContain('Add tests');
+      });
+
+      it('uses ralph-instructions.md prompt when file exists', () => {
+        mockFsExistsSync.mockReturnValue(true);
+        const issues: ExecutableWorkItem[] = [
+          { number: 1, title: 'Task', labels: [{ name: 'squad' }], assignees: [] },
+        ];
+        const prompt = buildAgentPrompt(issues, '/fake/team');
+        expect(prompt).toContain('ralph-instructions.md');
+        expect(prompt).toContain('Ralph, Go!');
+      });
+
+      it('uses fallback prompt when ralph-instructions.md is missing', () => {
+        mockFsExistsSync.mockReturnValue(false);
+        const issues: ExecutableWorkItem[] = [
+          { number: 1, title: 'Task', labels: [{ name: 'squad' }], assignees: [] },
+        ];
+        const prompt = buildAgentPrompt(issues, '/fake/team');
+        expect(prompt).toContain('autonomous work monitor');
+        expect(prompt).not.toContain('Ralph, Go!');
+      });
+
+      it('checks .squad/ralph-instructions.md inside teamRoot', () => {
+        // Verify that existsSync is called with the correct path so that the
+        // TEMPLATE_MANIFEST destination ('ralph-instructions.md' under .squad/)
+        // matches the lookup in execute.ts.
+        mockFsExistsSync.mockImplementation((p: unknown) => {
+          return typeof p === 'string' && p.endsWith('.squad/ralph-instructions.md');
+        });
+        const issues: ExecutableWorkItem[] = [
+          { number: 1, title: 'Task', labels: [{ name: 'squad' }], assignees: [] },
+        ];
+        const prompt = buildAgentPrompt(issues, '/some/repo');
+        expect(mockFsExistsSync).toHaveBeenCalledWith(
+          expect.stringContaining('.squad/ralph-instructions.md'),
+        );
+        // Path must be constructed from teamRoot, not a global path
+        const [calledPath] = mockFsExistsSync.mock.calls[0] as [string];
+        expect(calledPath).toContain('/some/repo');
+        expect(prompt).toContain('Ralph, Go!');
+      });
+
+      // Regression (#1490): a 2-arg call still derives the check from
+      // teamRoot + '.squad' (unchanged, backward compatible), but the
+      // real caller (ExecuteCapability.executeAll) now passes
+      // context.stateRoot as the 3rd arg, which must win when given —
+      // that's what lets ralph-instructions.md be found after externalize.
+      it('checks ralph-instructions.md under the passed stateDir when given, not teamRoot/.squad', () => {
+        mockFsExistsSync.mockImplementation((p: unknown) => {
+          return typeof p === 'string' && p.endsWith('ralph-instructions.md');
+        });
+        const issues: ExecutableWorkItem[] = [
+          { number: 1, title: 'Task', labels: [{ name: 'squad' }], assignees: [] },
+        ];
+        const prompt = buildAgentPrompt(issues, '/local/repo', '/external/state');
+        const [calledPath] = mockFsExistsSync.mock.calls[0] as [string];
+        expect(calledPath.replace(/\\/g, '/')).toBe('/external/state/ralph-instructions.md');
+        expect(calledPath.replace(/\\/g, '/')).not.toContain('/local/repo');
+        expect(prompt).toContain('Ralph, Go!');
+      });
+
+      it('formats labels and assignees in issue list', () => {
+        const issues: ExecutableWorkItem[] = [{
+          number: 42,
+          title: 'Fix auth',
+          labels: [{ name: 'squad:eecom' }, { name: 'P1' }],
+          assignees: [{ login: 'alice' }],
+        }];
+        const prompt = buildAgentPrompt(issues, '/fake');
+        expect(prompt).toContain('squad:eecom, P1');
+        expect(prompt).toContain('alice');
+      });
+    });
+
+    describe('findExecutableIssues (edge cases)', () => {
+      const roster = [{ name: 'EECOM', label: 'squad:eecom', expertise: [] as string[] }];
+
+      it('accepts bare "squad" label', () => {
+        const issues: ExecutableWorkItem[] = [
+          { number: 1, title: 'T', labels: [{ name: 'squad' }], assignees: [] },
+        ];
+        expect(findExecutableIssues(roster, null, issues)).toHaveLength(1);
+      });
+
+      it('accepts "squad:" prefixed labels', () => {
+        const issues: ExecutableWorkItem[] = [
+          { number: 1, title: 'T', labels: [{ name: 'squad:gnc' }], assignees: [] },
+        ];
+        expect(findExecutableIssues(roster, null, issues)).toHaveLength(1);
+      });
+
+      it('rejects all blocking label variants', () => {
+        for (const label of ['status:blocked', 'status:wontfix', 'status:on-hold', 'blocked']) {
+          const issues: ExecutableWorkItem[] = [{
+            number: 1, title: 'T',
+            labels: [{ name: 'squad' }, { name: label }],
+            assignees: [],
+          }];
+          expect(
+            findExecutableIssues(roster, null, issues),
+            `should reject "${label}"`,
+          ).toHaveLength(0);
+        }
+      });
+
+      it('returns empty when all issues are filtered out', () => {
+        const issues: ExecutableWorkItem[] = [
+          { number: 1, title: 'Assigned', labels: [{ name: 'squad' }], assignees: [{ login: 'bob' }] },
+          { number: 2, title: 'Blocked', labels: [{ name: 'squad' }, { name: 'status:blocked' }], assignees: [] },
+          { number: 3, title: 'No label', labels: [{ name: 'bug' }], assignees: [] },
+        ];
+        expect(findExecutableIssues(roster, null, issues)).toHaveLength(0);
+      });
+
+      it('returns empty for empty input', () => {
+        expect(findExecutableIssues(roster, null, [])).toHaveLength(0);
+      });
+    });
+
+    describe('preflight', () => {
+      it('succeeds when gh CLI is available', async () => {
+        const cap = new ExecuteCapability();
+        const result = await cap.preflight(makeContext());
+        expect(result.ok).toBe(true);
+      });
+
+      it('fails when gh CLI is not found', async () => {
+        mockExecFile.mockImplementation((...args: unknown[]) => {
+          const cb = findCallback(args);
+          if (cb) cb(new Error('not found'));
+          return {};
+        });
+        const cap = new ExecuteCapability();
+        const result = await cap.preflight(makeContext());
+        expect(result.ok).toBe(false);
+        expect(result.reason).toContain('gh');
+      });
+    });
+
+    describe('execute', () => {
+      it('returns success with no issues from adapter', async () => {
+        const cap = new ExecuteCapability();
+        const result = await cap.execute(makeContext());
+        expect(result.success).toBe(true);
+        expect(result.summary).toContain('no squad-labeled issues');
+      });
+
+      it('returns success when all issues are filtered out', async () => {
+        const cap = new ExecuteCapability();
+        const ctx = makeContext({
+          adapter: mockAdapter([
+            { id: 1, title: 'Assigned task', tags: ['squad'], assignedTo: 'human' },
+          ]),
+        });
+        const result = await cap.execute(ctx);
+        expect(result.success).toBe(true);
+        expect(result.summary).toContain('no squad-labeled issues');
+      });
+
+      it('dispatches agent for eligible issues', async () => {
+        const cap = new ExecuteCapability();
+        const ctx = makeContext({
+          adapter: mockAdapter([
+            { id: 1, title: 'Fix bug', tags: ['squad:eecom'] },
+          ]),
+        });
+        const result = await cap.execute(ctx);
+        expect(result.success).toBe(true);
+        expect(result.summary).toContain('agent dispatched');
+        expect(result.data?.dispatched).toBe(1);
+      });
+
+      it('handles adapter errors gracefully', async () => {
+        const cap = new ExecuteCapability();
+        const ctx = makeContext({
+          adapter: {
+            listWorkItems: vi.fn().mockRejectedValue(new Error('network error')),
+          } as unknown as WatchContext['adapter'],
+        });
+        const result = await cap.execute(ctx);
+        expect(result.success).toBe(false);
+        expect(result.summary).toContain('network error');
+      });
+
+      it('reports agent failure', async () => {
+        mockExecFile.mockImplementation((...args: unknown[]) => {
+          const cb = findCallback(args);
+          if (cb) cb(new Error('agent crashed'));
+          return {};
+        });
+        const cap = new ExecuteCapability();
+        const ctx = makeContext({
+          adapter: mockAdapter([{ id: 1, title: 'Fix', tags: ['squad'] }]),
+        });
+        const result = await cap.execute(ctx);
+        expect(result.success).toBe(false);
+        expect(result.summary).toContain('agent failed');
+      });
+
+      it('reports timeout when agent process is killed', async () => {
+        mockExecFile.mockImplementation((...args: unknown[]) => {
+          const cb = findCallback(args);
+          if (cb) cb(Object.assign(new Error('killed'), { killed: true }));
+          return {};
+        });
+        const cap = new ExecuteCapability();
+        const ctx = makeContext({
+          adapter: mockAdapter([{ id: 1, title: 'Fix', tags: ['squad'] }]),
+        });
+        const result = await cap.execute(ctx);
+        expect(result.success).toBe(false);
+        expect(result.summary).toContain('Timed out');
+      });
+
+      it('uses custom agentCmd when provided', async () => {
+        const cap = new ExecuteCapability();
+        const ctx = makeContext({
+          agentCmd: 'my-agent --flag',
+          adapter: mockAdapter([{ id: 1, title: 'Fix', tags: ['squad'] }]),
+        });
+        await cap.execute(ctx);
+        expect(mockExecFile).toHaveBeenCalledWith(
+          'my-agent',
+          expect.arrayContaining(['--flag', '-p']),
+          expect.any(Object),
+          expect.any(Function),
+        );
+      });
+
+      it('tracks and untracks the spawned pid via context.pidTracker', async () => {
+        let exitHandler: (() => void) | undefined;
+        mockExecFile.mockImplementation((...args: unknown[]) => {
+          const cb = findCallback(args);
+          if (cb) cb(null, '', '');
+          return {
+            pid: 4242,
+            on: (event: string, handler: () => void) => {
+              if (event === 'exit') exitHandler = handler;
+            },
+          };
+        });
+        const track = vi.fn();
+        const untrack = vi.fn();
+        const cap = new ExecuteCapability();
+        const ctx = makeContext({
+          pidTracker: { track, untrack },
+          adapter: mockAdapter([{ id: 1, title: 'Fix', tags: ['squad'] }]),
+        });
+
+        await cap.execute(ctx);
+
+        expect(track).toHaveBeenCalledWith(4242, expect.stringContaining('#1'));
+        expect(untrack).not.toHaveBeenCalled();
+        exitHandler?.();
+        expect(untrack).toHaveBeenCalledWith(4242);
+      });
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────
+  // CleanupCapability — file selection logic, round gating
+  // ────────────────────────────────────────────────────────────────
+
+  describe('CleanupCapability', () => {
+    describe('preflight', () => {
+      it('succeeds when .squad directory exists', async () => {
+        mockStorage.existsSync.mockReturnValue(true);
+        const cap = new CleanupCapability();
+        const result = await cap.preflight(makeContext());
+        expect(result.ok).toBe(true);
+      });
+
+      it('fails when .squad directory is missing', async () => {
+        mockStorage.existsSync.mockReturnValue(false);
+        const cap = new CleanupCapability();
+        const result = await cap.preflight(makeContext());
+        expect(result.ok).toBe(false);
+        expect(result.reason).toContain('.squad');
+      });
+    });
+
+    describe('execute', () => {
+      it('skips non-Nth rounds (default every 10)', async () => {
+        const cap = new CleanupCapability();
+        const result = await cap.execute(makeContext({ round: 5 }));
+        expect(result.success).toBe(true);
+        expect(result.summary).toContain('skipped');
+      });
+
+      it('always runs on round 1', async () => {
+        const cap = new CleanupCapability();
+        const result = await cap.execute(makeContext({ round: 1 }));
+        expect(result.success).toBe(true);
+        expect(result.summary).not.toContain('skipped');
+      });
+
+      it('runs on every Nth round', async () => {
+        const cap = new CleanupCapability();
+        const result = await cap.execute(makeContext({ round: 10 }));
+        expect(result.summary).not.toContain('skipped');
+      });
+
+      it('respects custom everyNRounds config', async () => {
+        const cap = new CleanupCapability();
+        const result = await cap.execute(makeContext({ round: 3, config: { everyNRounds: 3 } }));
+        expect(result.summary).not.toContain('skipped');
+      });
+
+      it('falls back to defaults for invalid config values', async () => {
+        const cap = new CleanupCapability();
+        const result = await cap.execute(makeContext({ round: 5, config: { everyNRounds: -1 } }));
+        // Invalid value → default 10 → round 5 is skipped
+        expect(result.summary).toContain('skipped');
+      });
+
+      it('deletes scratch files', async () => {
+        mockStorage.listSync.mockImplementation((dir: string) => {
+          if (dir.includes('.scratch')) return ['temp1.md', 'temp2.md'];
+          return [];
+        });
+        const cap = new CleanupCapability();
+        const result = await cap.execute(makeContext({ round: 1 }));
+        expect(result.success).toBe(true);
+        expect(result.summary).toContain('scratch');
+        expect(result.summary).toContain('2');
+        expect(mockRmSync).toHaveBeenCalledTimes(2);
+      });
+
+      it('prunes old log files by date prefix, keeps recent ones', async () => {
+        mockStorage.listSync.mockImplementation((dir: string) => {
+          if (dir.includes('orchestration-log')) {
+            return ['2020-01-01-agent.md', '2099-12-31-agent.md'];
+          }
+          return [];
+        });
+        const cap = new CleanupCapability();
+        const result = await cap.execute(makeContext({ round: 1 }));
+        expect(result.success).toBe(true);
+        expect(result.summary).toContain('orchestration-log');
+        expect(result.data?.orchPruned).toBe(1); // only 2020 file
+      });
+
+      it('skips files without date prefixes during pruning', async () => {
+        mockStorage.listSync.mockImplementation((dir: string) => {
+          if (dir.includes('orchestration-log')) return ['no-date-file.md'];
+          return [];
+        });
+        const cap = new CleanupCapability();
+        const result = await cap.execute(makeContext({ round: 1 }));
+        expect(result.summary).toContain('nothing to do');
+      });
+
+      it('warns about stale decision inbox files', async () => {
+        mockStorage.listSync.mockImplementation((dir: string) => {
+          if (dir.includes('inbox')) return ['2020-01-01-old-decision.md'];
+          return [];
+        });
+        const cap = new CleanupCapability();
+        const result = await cap.execute(makeContext({ round: 1 }));
+        expect(result.success).toBe(true);
+        expect(result.summary).toContain('stale inbox');
+      });
+
+      it('reports nothing to do when all clean', async () => {
+        mockStorage.listSync.mockReturnValue([]);
+        const cap = new CleanupCapability();
+        const result = await cap.execute(makeContext({ round: 1 }));
+        expect(result.summary).toContain('nothing to do');
+      });
+    });
+
+    // Regression (#1490): before the fix, every path here was built from
+    // teamRoot + '.squad', so after `squad externalize` the local .squad/
+    // is a marker-only stub and every check silently sees an empty
+    // directory. Give teamRoot and stateRoot different fake roots and
+    // confirm the capability only ever looks under stateRoot.
+    describe('externalized state (#1490)', () => {
+      it('preflight checks stateRoot, not teamRoot/.squad', async () => {
+        mockStorage.existsSync.mockImplementation((dir: string) => dir === '/external/state');
+        const cap = new CleanupCapability();
+        const result = await cap.preflight(
+          makeContext({ teamRoot: '/local/repo', stateRoot: '/external/state' }),
+        );
+        expect(result.ok).toBe(true);
+        expect(mockStorage.existsSync).toHaveBeenCalledWith('/external/state');
+      });
+
+      it('execute lists scratch/orchestration-log/log/inbox under stateRoot, not teamRoot', async () => {
+        const seenDirs: string[] = [];
+        mockStorage.listSync.mockImplementation((dir: string) => {
+          seenDirs.push(dir);
+          return [];
+        });
+        const cap = new CleanupCapability();
+        await cap.execute(makeContext({ teamRoot: '/local/repo', stateRoot: '/external/state', round: 1 }));
+
+        expect(seenDirs.length).toBeGreaterThan(0);
+        for (const dir of seenDirs) {
+          const normalized = dir.replace(/\\/g, '/');
+          expect(normalized.startsWith('/external/state')).toBe(true);
+          expect(normalized.includes('/local/repo')).toBe(false);
+        }
+      });
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────
+  // DecisionHygieneCapability — inbox threshold + merge trigger
+  // ────────────────────────────────────────────────────────────────
+
+  describe('DecisionHygieneCapability', () => {
+    describe('preflight', () => {
+      it('succeeds when inbox directory exists', async () => {
+        mockStorage.existsSync.mockReturnValue(true);
+        const cap = new DecisionHygieneCapability();
+        const result = await cap.preflight(makeContext());
+        expect(result.ok).toBe(true);
+      });
+
+      it('fails when inbox directory is missing', async () => {
+        mockStorage.existsSync.mockReturnValue(false);
+        const cap = new DecisionHygieneCapability();
+        const result = await cap.preflight(makeContext());
+        expect(result.ok).toBe(false);
+        expect(result.reason).toContain('inbox');
+      });
+    });
+
+    describe('execute', () => {
+      it('skips when inbox has ≤5 files', async () => {
+        mockStorage.listSync.mockReturnValue(['a.md', 'b.md', 'c.md']);
+        const cap = new DecisionHygieneCapability();
+        const result = await cap.execute(makeContext());
+        expect(result.success).toBe(true);
+        expect(result.summary).toContain('3 files');
+        expect(result.summary).toContain('threshold');
+      });
+
+      it('triggers merge when inbox has >5 files', async () => {
+        mockStorage.listSync.mockReturnValue([
+          'a.md', 'b.md', 'c.md', 'd.md', 'e.md', 'f.md',
+        ]);
+        const cap = new DecisionHygieneCapability();
+        const result = await cap.execute(makeContext());
+        expect(result.success).toBe(true);
+        expect(result.summary).toContain('merged');
+        expect(result.summary).toContain('6');
+      });
+
+      it('reports error when merge agent fails', async () => {
+        mockStorage.listSync.mockReturnValue([
+          'a.md', 'b.md', 'c.md', 'd.md', 'e.md', 'f.md',
+        ]);
+        mockExecFile.mockImplementation((...args: unknown[]) => {
+          const cb = findCallback(args);
+          if (cb) cb(new Error('spawn failed'));
+          return {};
+        });
+        const cap = new DecisionHygieneCapability();
+        const result = await cap.execute(makeContext());
+        expect(result.success).toBe(false);
+        expect(result.summary).toContain('decision hygiene');
+      });
+
+      it('reports timeout when merge agent is killed', async () => {
+        mockStorage.listSync.mockReturnValue([
+          'a.md', 'b.md', 'c.md', 'd.md', 'e.md', 'f.md',
+        ]);
+        mockExecFile.mockImplementation((...args: unknown[]) => {
+          const cb = findCallback(args);
+          if (cb) cb(Object.assign(new Error('killed'), { killed: true }));
+          return {};
+        });
+        const cap = new DecisionHygieneCapability();
+        const result = await cap.execute(makeContext());
+        expect(result.success).toBe(false);
+        expect(result.summary).toContain('Timed out');
+      });
+
+      it('handles missing inbox directory gracefully', async () => {
+        mockStorage.existsSync.mockReturnValue(false);
+        const cap = new DecisionHygieneCapability();
+        const result = await cap.execute(makeContext());
+        expect(result.success).toBe(true);
+        expect(result.summary).toContain('no decision inbox');
+      });
+    });
+
+    // Regression (#1490): preflight/execute both built the inbox path from
+    // teamRoot + '.squad' — after externalize the inbox lives at stateRoot
+    // instead, and the old code silently never found it.
+    describe('externalized state (#1490)', () => {
+      it('preflight/execute both check the inbox under stateRoot, not teamRoot', async () => {
+        mockStorage.existsSync.mockImplementation((dir: string) => dir.replace(/\\/g, '/').startsWith('/external/state'));
+        const seenDirs: string[] = [];
+        mockStorage.listSync.mockImplementation((dir: string) => {
+          seenDirs.push(dir);
+          return ['a.md', 'b.md', 'c.md', 'd.md', 'e.md', 'f.md'];
+        });
+        const cap = new DecisionHygieneCapability();
+        const ctx = makeContext({ teamRoot: '/local/repo', stateRoot: '/external/state' });
+
+        const preflight = await cap.preflight(ctx);
+        expect(preflight.ok).toBe(true);
+
+        const result = await cap.execute(ctx);
+        expect(result.success).toBe(true);
+        expect(result.summary).toContain('merged');
+        expect(seenDirs.length).toBeGreaterThan(0);
+        for (const dir of seenDirs) {
+          expect(dir.replace(/\\/g, '/').startsWith('/external/state')).toBe(true);
+        }
+      });
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────
+  // RetroCapability — retrospective staleness check + write
+  // ────────────────────────────────────────────────────────────────
+
+  describe('RetroCapability', () => {
+    describe('execute', () => {
+      it('reports not due when a recent retrospective log exists', async () => {
+        const today = new Date().toISOString().slice(0, 10);
+        mockStorage.listSync.mockReturnValue([`${today}-retrospective.md`]);
+        const cap = new RetroCapability();
+        const result = await cap.execute(makeContext());
+        expect(result.success).toBe(true);
+        expect(result.summary).toBe('retro not due');
+      });
+
+      // Regression (#1490): the staleness check listed teamRoot + '.squad/log'
+      // — after externalize that's the local marker dir (empty), so the
+      // capability always saw "no retro found" and fired on every round
+      // regardless of an existing, externalized retrospective log.
+      it('checks log/ under stateRoot, not teamRoot, for existing retrospectives', async () => {
+        const today = new Date().toISOString().slice(0, 10);
+        const seenDirs: string[] = [];
+        mockStorage.listSync.mockImplementation((dir: string) => {
+          seenDirs.push(dir);
+          return dir.replace(/\\/g, '/') === '/external/state/log' ? [`${today}-retrospective.md`] : [];
+        });
+        const cap = new RetroCapability();
+        const result = await cap.execute(
+          makeContext({ teamRoot: '/local/repo', stateRoot: '/external/state' }),
+        );
+        expect(seenDirs.map(d => d.replace(/\\/g, '/'))).toContain('/external/state/log');
+        expect(result.summary).toBe('retro not due');
+      });
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────
+  // SelfPullCapability — git stash/fetch/pull safety
+  // ────────────────────────────────────────────────────────────────
+
+  describe('SelfPullCapability', () => {
+    describe('preflight', () => {
+      it('succeeds when git is available', async () => {
+        const cap = new SelfPullCapability();
+        const result = await cap.preflight(makeContext());
+        expect(result.ok).toBe(true);
+      });
+
+      it('fails when git is not found', async () => {
+        mockExecFile.mockImplementation((...args: unknown[]) => {
+          const cb = findCallback(args);
+          if (cb) cb(new Error('not found'));
+          return {};
+        });
+        const cap = new SelfPullCapability();
+        const result = await cap.preflight(makeContext());
+        expect(result.ok).toBe(false);
+        expect(result.reason).toContain('git');
+      });
+    });
+
+    describe('execute', () => {
+      it('succeeds with clean pull (no source changes)', async () => {
+        mockExecFileSync.mockImplementation((_cmd: unknown, args: unknown) => {
+          const a = args as string[];
+          if (a.includes('rev-parse')) return 'abc123\n';
+          if (a.includes('--porcelain')) return '';
+          return '';
+        });
+
+        const cap = new SelfPullCapability();
+        const result = await cap.execute(makeContext());
+        expect(result.success).toBe(true);
+        expect(result.summary).toBe('git pull ok');
+      });
+
+      it('stashes dirty working tree before pulling', async () => {
+        const stashCalls: string[][] = [];
+        mockExecFileSync.mockImplementation((_cmd: unknown, args: unknown) => {
+          const a = args as string[];
+          if (a[0] === 'stash') stashCalls.push([...a]);
+          if (a.includes('rev-parse')) return 'abc123\n';
+          if (a.includes('--porcelain')) return 'M file.txt\n';
+          return '';
+        });
+
+        const cap = new SelfPullCapability();
+        const result = await cap.execute(makeContext());
+        expect(result.success).toBe(true);
+        expect(stashCalls).toContainEqual(
+          expect.arrayContaining(['stash', '--include-untracked']),
+        );
+        expect(stashCalls).toContainEqual(
+          expect.arrayContaining(['stash', 'pop']),
+        );
+      });
+
+      it('reports failure (not success) when stash pop conflicts — local changes stay stashed', async () => {
+        mockExecFileSync.mockImplementation((_cmd: unknown, args: unknown) => {
+          const a = args as string[];
+          if (a[0] === 'stash' && a[1] === 'pop') throw new Error('merge conflict');
+          if (a[0] === 'stash') return '';
+          if (a.includes('rev-parse')) return 'abc123\n';
+          if (a.includes('--porcelain')) return 'M file.txt\n';
+          return '';
+        });
+
+        const consoleSpy = vi.spyOn(console, 'log');
+        const cap = new SelfPullCapability();
+        const result = await cap.execute(makeContext());
+        // A stash that can't be restored is a failure the round report must
+        // surface, not a silent success — the user's local changes are
+        // sitting in `git stash` with no indication anywhere else.
+        expect(result.success).toBe(false);
+        expect(result.summary).toContain('left local changes stashed');
+        expect(consoleSpy).toHaveBeenCalledWith(
+          expect.stringContaining('left local changes stashed'),
+        );
+        consoleSpy.mockRestore();
+      });
+
+      // Regression (critical): before the fix, a fetch/pull failure threw
+      // past the stash-pop step entirely — `git stash pop` was never even
+      // attempted, so a dirty working tree got silently stashed and
+      // abandoned while the capability reported success. Fails on
+      // unfixed code (stashCalls never contains a 'pop' call here);
+      // passes with the fix (pop is always attempted after fetch/pull).
+      it('still attempts stash pop after a fetch/pull failure, and restores it when possible', async () => {
+        const stashCalls: string[][] = [];
+        mockExecFileSync.mockImplementation((_cmd: unknown, args: unknown) => {
+          const a = args as string[];
+          if (a[0] === 'stash') stashCalls.push([...a]);
+          if (a.includes('rev-parse')) return 'abc123\n';
+          if (a.includes('--porcelain')) return 'M file.txt\n';
+          return '';
+        });
+        mockExecFile.mockImplementation((...args: unknown[]) => {
+          const cb = findCallback(args);
+          if (cb) cb(new Error('not a fast-forward'));
+          return {};
+        });
+
+        const cap = new SelfPullCapability();
+        const result = await cap.execute(makeContext());
+
+        expect(stashCalls).toContainEqual(
+          expect.arrayContaining(['stash', 'pop']),
+        );
+        // Stash was successfully restored, so this is the same benign
+        // "pull skipped" outcome as a clean tree hitting the same pull
+        // failure — the user's local changes are back, nothing lost.
+        expect(result.success).toBe(true);
+        expect(result.summary).toContain('skipped');
+      });
+
+      // Regression (critical): the failure-safety invariant — if the stash
+      // genuinely cannot be restored after a pull failure, that must be a
+      // visible failure, not folded into the same "skipped" success message
+      // as the benign case above.
+      it('reports failure when both pull and stash pop fail — does not mask a stuck stash as "skipped"', async () => {
+        mockExecFileSync.mockImplementation((_cmd: unknown, args: unknown) => {
+          const a = args as string[];
+          if (a[0] === 'stash' && a[1] === 'pop') throw new Error('conflict after failed pull');
+          if (a[0] === 'stash') return '';
+          if (a.includes('rev-parse')) return 'abc123\n';
+          if (a.includes('--porcelain')) return 'M file.txt\n';
+          return '';
+        });
+        mockExecFile.mockImplementation((...args: unknown[]) => {
+          const cb = findCallback(args);
+          if (cb) cb(new Error('not a fast-forward'));
+          return {};
+        });
+
+        const cap = new SelfPullCapability();
+        const result = await cap.execute(makeContext());
+        expect(result.success).toBe(false);
+        expect(result.summary).toContain('pull failed');
+        expect(result.summary).toContain('left local changes stashed');
+      });
+
+      it('detects source changes and recommends restart', async () => {
+        let revParseCount = 0;
+        mockExecFileSync.mockImplementation((_cmd: unknown, args: unknown) => {
+          const a = args as string[];
+          if (a.includes('rev-parse')) {
+            revParseCount++;
+            return revParseCount === 1 ? 'abc123\n' : 'def456\n';
+          }
+          if (a.includes('--porcelain')) return '';
+          if (a.includes('--name-only')) return 'packages/squad-cli/src/watch.ts\n';
+          return '';
+        });
+
+        const cap = new SelfPullCapability();
+        const result = await cap.execute(makeContext());
+        expect(result.success).toBe(true);
+        expect(result.summary).toContain('restart recommended');
+      });
+
+      it('handles fetch/pull failure gracefully', async () => {
+        mockExecFileSync.mockImplementation((_cmd: unknown, args: unknown) => {
+          const a = args as string[];
+          if (a.includes('rev-parse')) return 'abc123\n';
+          if (a.includes('--porcelain')) return '';
+          return '';
+        });
+        mockExecFile.mockImplementation((...args: unknown[]) => {
+          const cb = findCallback(args);
+          if (cb) cb(new Error('network error'));
+          return {};
+        });
+
+        const cap = new SelfPullCapability();
+        const result = await cap.execute(makeContext());
+        expect(result.success).toBe(true);
+        expect(result.summary).toContain('skipped');
+      });
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────
+  // BoardCapability — metadata + preflight
+  // (execute() skipped: promisify(execFile) requires custom symbol)
+  // ────────────────────────────────────────────────────────────────
+
+  describe('BoardCapability', () => {
+    describe('preflight', () => {
+      it('succeeds when gh project CLI is available', async () => {
+        const cap = new BoardCapability();
+        const result = await cap.preflight(makeContext());
+        expect(result.ok).toBe(true);
+      });
+
+      it('fails when gh project CLI is not available', async () => {
+        mockExecFile.mockImplementation((...args: unknown[]) => {
+          const cb = findCallback(args);
+          if (cb) cb(new Error('not available'));
+          return {};
+        });
+        const cap = new BoardCapability();
+        const result = await cap.preflight(makeContext());
+        expect(result.ok).toBe(false);
+        expect(result.reason).toContain('gh project');
+      });
+    });
+  });
+});

@@ -6,10 +6,14 @@
  */
 
 import path from 'node:path';
-import fs from 'node:fs';
+// createReadStream retained — streaming not in StorageProvider scope
+import { createReadStream } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { RemoteBridge } from '@bradygaster/squad-sdk';
+import { FSStorageProvider, RemoteBridge } from '@bradygaster/squad-sdk';
+
+const storage = new FSStorageProvider();
 import type { RemoteBridgeConfig } from '@bradygaster/squad-sdk';
+import { resolveStateDir } from '../core/effective-squad-dir.js';
 import {
   isDevtunnelAvailable,
   createTunnel,
@@ -31,14 +35,33 @@ export interface RCOptions {
   path?: string;
 }
 
+/**
+ * Load the agent roster from team.md, following the externalized state
+ * marker when present (#1398). The passed `squadDir` stays the local
+ * working-tree dir — only the team.md read is redirected.
+ */
+export function loadRosterAgents(squadDir: string): Array<{ name: string; role: string }> {
+  const agents: Array<{ name: string; role: string }> = [];
+  const stateDir = resolveStateDir(squadDir);
+  const teamMd = storage.readSync(path.join(stateDir, 'team.md')) ?? '';
+  const memberLines = teamMd.split('\n').filter(l => l.startsWith('|') && l.includes('Active'));
+  for (const line of memberLines) {
+    const cols = line.split('|').map(c => c.trim()).filter(Boolean);
+    if (cols.length >= 2 && cols[0] !== 'Name') {
+      agents.push({ name: cols[0]!, role: cols[1]! });
+    }
+  }
+  return agents;
+}
+
 export async function runRC(cwd: string, options: RCOptions): Promise<void> {
   const { repo, branch } = getGitInfo(cwd);
   const machine = getMachineId();
 
   // Resolve squad directory
-  const squadDir = fs.existsSync(path.join(cwd, '.squad'))
+  const squadDir = storage.existsSync(path.join(cwd, '.squad'))
     ? path.join(cwd, '.squad')
-    : fs.existsSync(path.join(cwd, '.ai-team'))
+    : storage.existsSync(path.join(cwd, '.ai-team'))
       ? path.join(cwd, '.ai-team')
       : '';
 
@@ -52,14 +75,7 @@ export async function runRC(cwd: string, options: RCOptions): Promise<void> {
   const agents: Array<{name: string; role: string}> = [];
   if (squadDir) {
     try {
-      const teamMd = fs.readFileSync(path.join(squadDir, 'team.md'), 'utf-8');
-      const memberLines = teamMd.split('\n').filter(l => l.startsWith('|') && l.includes('Active'));
-      for (const line of memberLines) {
-        const cols = line.split('|').map(c => c.trim()).filter(Boolean);
-        if (cols.length >= 2 && cols[0] !== 'Name') {
-          agents.push({ name: cols[0]!, role: cols[1]! });
-        }
-      }
+      agents.push(...loadRosterAgents(squadDir));
       console.log(`  ${GREEN}✓${RESET} Loaded ${agents.length} agents from team.md\n`);
     } catch {
       console.log(`  ${YELLOW}⚠${RESET} Could not read team.md\n`);
@@ -134,11 +150,11 @@ export async function runRC(cwd: string, options: RCOptions): Promise<void> {
 
     // #2: EISDIR guard — check if path is a directory before createReadStream
     try {
-      const stat = fs.statSync(filePath);
-      if (stat.isDirectory()) {
+      const stat = storage.statSync(filePath);
+      if (stat?.isDirectory) {
         filePath = path.join(filePath, 'index.html');
-        if (!fs.existsSync(filePath)) { res.writeHead(404); res.end(); return; }
-      }
+        if (!storage.existsSync(filePath)) { res.writeHead(404); res.end(); return; }
+      } else if (!stat) { res.writeHead(404); res.end(); return; }
     } catch { res.writeHead(404); res.end(); return; }
 
     const ext = path.extname(filePath);
@@ -160,7 +176,7 @@ export async function runRC(cwd: string, options: RCOptions): Promise<void> {
       'Cache-Control': 'no-store',
     });
     // #8: Handle createReadStream errors
-    const stream = fs.createReadStream(filePath);
+    const stream = createReadStream(filePath);
     stream.on('error', () => { if (!res.headersSent) { res.writeHead(500); } res.end(); });
     stream.pipe(res);
   });
@@ -190,7 +206,7 @@ export async function runRC(cwd: string, options: RCOptions): Promise<void> {
       'C:', 'ProgramData', 'global-npm', 'node_modules', '@github', 'copilot',
       'node_modules', '@github', 'copilot-win32-x64', 'copilot.exe'
     );
-    if (fs.existsSync(winPath)) {
+    if (storage.existsSync(winPath)) {
       copilotCmd = winPath;
     }
   }

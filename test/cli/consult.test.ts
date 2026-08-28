@@ -19,11 +19,12 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { tmpdir } from 'node:os';
 import { execSync } from 'node:child_process';
 import { isConsultMode, type SquadDirConfig } from '@bradygaster/squad-sdk';
 
 const TEST_ROOT = join(
-  process.cwd(),
+  tmpdir(),
   `.test-cli-consult-${randomBytes(4).toString('hex')}`,
 );
 
@@ -61,6 +62,12 @@ function runSquad(
       exitCode: e.status ?? 1,
     };
   }
+}
+
+function expectedGlobalSquadPath(globalConfig: string): string {
+  if (process.platform === 'win32') return join(globalConfig, 'squad');
+  if (process.platform === 'darwin') return join(globalConfig, 'Library', 'Application Support', 'squad');
+  return join(globalConfig, 'squad');
 }
 
 describe('CLI: squad consult', { timeout: 30_000 }, () => {
@@ -173,6 +180,7 @@ describe('CLI: squad consult', { timeout: 30_000 }, () => {
       // This ensures the SDK won't find a personal squad
       const nonexistent = join(TEST_ROOT, 'nonexistent-config');
       const result = runSquad('consult', TEST_ROOT, {
+        HOME: nonexistent,
         XDG_CONFIG_HOME: nonexistent,
         APPDATA: nonexistent,
         LOCALAPPDATA: nonexistent,
@@ -186,6 +194,7 @@ describe('CLI: squad consult', { timeout: 30_000 }, () => {
     const globalConfig = join(TEST_ROOT, 'xdg-config');
     const projectDir = join(TEST_ROOT, 'their-project');
     const envWithGlobal = {
+      HOME: globalConfig,
       XDG_CONFIG_HOME: globalConfig,
       // On Windows, resolveGlobalSquadPath() reads APPDATA, not XDG_CONFIG_HOME
       APPDATA: globalConfig,
@@ -199,7 +208,7 @@ describe('CLI: squad consult', { timeout: 30_000 }, () => {
       expect(initResult.exitCode).toBe(0);
 
       // Verify the personal squad was created
-      const personalSquadDir = join(globalConfig, 'squad', '.squad');
+      const personalSquadDir = join(expectedGlobalSquadPath(globalConfig), 'personal-squad');
       expect(existsSync(personalSquadDir)).toBe(true);
 
       // 2. Create a fresh project with its own git repo (no .squad/)

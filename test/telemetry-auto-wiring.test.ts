@@ -173,14 +173,20 @@ describe('estimateCost()', () => {
 
   it('works for fast-tier models', () => {
     const cost = estimateCost('claude-haiku-4.5', 10000, 5000);
-    // pricing: input $0.0000008/token, output $0.000004/token
-    expect(cost).toBeCloseTo(0.008 + 0.02, 6);
+    // Pricing: input $0.000001/token, output $0.000005/token.
+    expect(cost).toBeCloseTo(0.01 + 0.025, 6);
+  });
+
+  it('uses the current GPT-5.6 Luna rates', () => {
+    const cost = estimateCost('gpt-5.6-luna', 10000, 5000);
+    // Pricing: input $0.0000002/token, output $0.0000012/token.
+    expect(cost).toBeCloseTo(0.002 + 0.006, 6);
   });
 
   it('works for premium-tier models', () => {
     const cost = estimateCost('claude-opus-4.6', 1000, 500);
-    // pricing: input $0.000015/token, output $0.000075/token
-    expect(cost).toBeCloseTo(0.015 + 0.0375, 6);
+    // Pricing: input $0.000005/token, output $0.000025/token.
+    expect(cost).toBeCloseTo(0.005 + 0.0125, 6);
   });
 });
 
@@ -189,12 +195,15 @@ describe('estimateCost()', () => {
 // ============================================================================
 
 describe('MODEL_CATALOG pricing', () => {
-  it('all models have pricing data', () => {
+  it('models expose valid pricing when present', () => {
+    // Pricing is optional: newer catalog entries intentionally omit per-token
+    // USD pricing rather than hardcoding guessed values (issue #1080). When a
+    // model does carry pricing, it must be well-formed.
     for (const model of MODEL_CATALOG) {
-      expect(model.pricing, `Model ${model.id} missing pricing`).toBeDefined();
+      if (!model.pricing) continue;
       const pricing = model.pricing as ModelPricing;
-      expect(pricing.inputPerToken).toBeGreaterThan(0);
-      expect(pricing.outputPerToken).toBeGreaterThan(0);
+      expect(pricing.inputPerToken, `Model ${model.id} inputPerToken`).toBeGreaterThan(0);
+      expect(pricing.outputPerToken, `Model ${model.id} outputPerToken`).toBeGreaterThan(0);
     }
   });
 

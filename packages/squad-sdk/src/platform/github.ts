@@ -67,7 +67,7 @@ export class GitHubAdapter implements PlatformAdapter {
   async getWorkItem(id: number): Promise<WorkItem> {
     const output = this.gh([
       'issue', 'view', String(id), '--repo', this.repoFlag,
-      '--json', 'number,title,state,labels,assignees,url',
+      '--json', 'number,title,state,labels,assignees,url,body',
     ]);
     const issue = parseJson<{
       number: number;
@@ -76,6 +76,7 @@ export class GitHubAdapter implements PlatformAdapter {
       labels: Array<{ name: string }>;
       assignees: Array<{ login: string }>;
       url: string;
+      body?: string;
     }>(output);
 
     return {
@@ -84,6 +85,7 @@ export class GitHubAdapter implements PlatformAdapter {
       state: issue.state.toLowerCase(),
       tags: issue.labels.map((l) => l.name),
       assignedTo: issue.assignees[0]?.login,
+      body: issue.body,
       url: issue.url,
     };
   }
@@ -128,12 +130,36 @@ export class GitHubAdapter implements PlatformAdapter {
     this.gh(['issue', 'edit', String(workItemId), '--repo', this.repoFlag, '--add-label', tag]);
   }
 
+  async ensureTag(tag: string, options?: { color?: string; description?: string }): Promise<void> {
+    const args = ['label', 'create', tag, '--repo', this.repoFlag, '--force'];
+    if (options?.color) args.push('--color', options.color);
+    if (options?.description) args.push('--description', options.description);
+    try {
+      this.gh(args);
+    } catch {
+      // Label already exists or creation failed — continue either way
+    }
+  }
+
   async removeTag(workItemId: number, tag: string): Promise<void> {
     this.gh(['issue', 'edit', String(workItemId), '--repo', this.repoFlag, '--remove-label', tag]);
   }
 
   async addComment(workItemId: number, comment: string): Promise<void> {
     this.gh(['issue', 'comment', String(workItemId), '--repo', this.repoFlag, '--body', comment]);
+  }
+
+  async setAssignee(workItemId: number, assignee: string | undefined): Promise<void> {
+    const args = ['issue', 'edit', String(workItemId), '--repo', this.repoFlag];
+    if (assignee) {
+      args.push('--add-assignee', assignee);
+    } else {
+      // Unassign: remove the current assignee (if any).
+      const wi = await this.getWorkItem(workItemId);
+      if (!wi.assignedTo) return;
+      args.push('--remove-assignee', wi.assignedTo);
+    }
+    this.gh(args);
   }
 
   async listPullRequests(options: { status?: string; limit?: number }): Promise<PullRequest[]> {
@@ -211,6 +237,37 @@ export class GitHubAdapter implements PlatformAdapter {
 
   async mergePullRequest(id: number): Promise<void> {
     this.gh(['pr', 'merge', String(id), '--repo', this.repoFlag, '--merge']);
+  }
+
+  async ensureAuth(preferredUser?: string): Promise<void> {
+    try {
+      // 1. Check current gh auth
+      const authStatus = execFileSync('gh', ['auth', 'status', '--active'], EXEC_OPTS).trim();
+      const activeMatch = authStatus.match(/account\s+(\S+)/);
+      const activeUser = activeMatch?.[1] || '';
+
+      // 2. Determine target user
+      let targetUser = preferredUser || '';
+
+      if (!targetUser) {
+        // Auto-detect from remote URL — works for EMU repos where org = account
+        const remoteUrl = execFileSync('git', ['remote', 'get-url', 'origin'], EXEC_OPTS).trim();
+        const httpsMatch = remoteUrl.match(/github\.com[/:]([^/]+)\//);
+        if (httpsMatch?.[1]) targetUser = httpsMatch[1];
+      }
+
+      if (!targetUser || activeUser === targetUser) return; // Already correct or can't determine
+
+      // 3. Switch
+      try {
+        execFileSync('gh', ['auth', 'switch', '--user', targetUser], EXEC_OPTS);
+        console.log(`✅ Auth context switched to ${targetUser}`);
+      } catch {
+        // targetUser might not be a valid account — non-fatal
+      }
+    } catch {
+      // Non-fatal — continue with whatever auth is active
+    }
   }
 
   async createBranch(name: string, fromBranch?: string): Promise<void> {

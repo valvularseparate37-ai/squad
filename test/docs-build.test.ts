@@ -13,13 +13,21 @@ const CONTENT_DIR = join(DOCS_DIR, 'src', 'content');
 const DOCS_CONTENT_DIR = join(CONTENT_DIR, 'docs');
 const BLOG_CONTENT_DIR = join(CONTENT_DIR, 'blog');
 const DIST_DIR = join(DOCS_DIR, 'dist');
+const ASTRO_BIN = join(DOCS_DIR, 'node_modules', '.bin', process.platform === 'win32' ? 'astro.cmd' : 'astro');
+const DOCS_BUILD_TIMEOUT_MS = 240_000;
+
+function docsBuildSkipReason(): string | null {
+  if (!existsSync(join(DOCS_DIR, 'package.json'))) return 'docs/package.json missing';
+  if (!existsSync(ASTRO_BIN)) return 'docs dependencies not installed';
+  return null;
+}
 
 // Expected content directories in src/content/docs/
-const EXPECTED_GET_STARTED = ['installation', 'first-session', 'five-minute-start', 'choosing-your-path', 'migration'];
+const EXPECTED_GET_STARTED = ['installation', 'first-session', 'five-minute-start', 'choose-your-interface', 'migration'];
 
-const EXPECTED_GUIDES = ['build-autonomous-agent', 'building-extensions', 'contributing', 'contributors', 'extensibility', 'faq', 'github-auth-setup', 'personal-squad', 'sample-prompts', 'shell', 'tips-and-tricks'];
+const EXPECTED_GUIDES = ['agent-framework-integration', 'build-autonomous-agent', 'building-extensions', 'building-resilient-agents', 'contributing', 'contributors', 'extensibility', 'faq', 'gh-aw', 'github-auth-setup', 'personal-squad', 'sample-prompts', 'shell', 'tips-and-tricks'];
 
-const EXPECTED_REFERENCE = ['cli', 'sdk', 'config', 'api-reference', 'integration', 'tools-and-hooks', 'glossary'];
+const EXPECTED_REFERENCE = ['cli', 'sdk', 'config', 'api-reference', 'integration', 'tools-and-hooks', 'glossary', 'container-image', 'state-backend-selection'];
 
 const EXPECTED_SCENARIOS = [
   'aspire-dashboard',
@@ -47,6 +55,10 @@ const EXPECTED_SCENARIOS = [
   'team-state-storage',
   'troubleshooting',
   'upgrading',
+  'azure-container-apps',
+  'aks-deployment',
+  'production-observability',
+  'production-troubleshooting',
 ];
 
 const EXPECTED_FEATURES = [
@@ -74,12 +86,14 @@ const EXPECTED_FEATURES = [
   'project-boards',
   'ralph',
   'rate-limiting',
-  'remote-control',
   'response-modes',
   'reviewer-protocol',
   'routing',
   'skills',
+  'standalone-install',
+  'storage-provider',
   'squad-rc',
+  'security-hardening',
   'streams',
   'team-setup',
   'upstream-inheritance',
@@ -151,7 +165,9 @@ describe('Docs Structure Validation', () => {
     it('all code blocks are properly fenced (even count of ```)', () => {
       for (const file of getAllMarkdownFiles()) {
         const content = readFile(file);
-        const fenceCount = (content.match(/```/g) || []).length;
+        // Anchor to line-start so inline/table backticks (e.g. documenting fence syntax)
+        // are not counted as real fence delimiters.
+        const fenceCount = (content.match(/^```/gm) || []).length;
         expect(fenceCount % 2, `${basename(file)} has mismatched fences`).toBe(0);
       }
     });
@@ -166,7 +182,9 @@ describe('Docs Structure Validation', () => {
   describe('Code Example Validation', () => {
     it('code blocks contain language specification or valid content', () => {
       for (const file of getAllMarkdownFiles()) {
-        const codeBlocks = readFile(file).match(/```[\s\S]*?```/g) || [];
+        // Anchor both opening and closing fences to line-start so inline
+        // backtick usage inside table cells or prose does not form phantom blocks.
+        const codeBlocks = readFile(file).match(/^```[\s\S]*?^```/gm) || [];
         for (const block of codeBlocks) {
           expect(block.split('\n').length).toBeGreaterThan(1);
         }
@@ -187,14 +205,17 @@ describe('Docs Structure Validation', () => {
 
 // --- Astro Build Tests ---
 
-describe('Docs Build Script (Astro)', () => {
+const DOCS_BUILD_SKIP_REASON = docsBuildSkipReason();
+
+describe.skipIf(DOCS_BUILD_SKIP_REASON !== null)(
+  `Docs Build Script (Astro) (${DOCS_BUILD_SKIP_REASON ?? 'enabled'})`,
+  () => {
   beforeAll(() => {
-    if (!existsSync(join(DOCS_DIR, 'package.json'))) return;
     if (existsSync(DIST_DIR)) {
       rmSync(DIST_DIR, { recursive: true, force: true });
     }
-    execSync('npm run build', { cwd: DOCS_DIR, timeout: 120_000 });
-  }, 120_000);
+    execSync('npm run build', { cwd: DOCS_DIR, timeout: DOCS_BUILD_TIMEOUT_MS });
+  }, DOCS_BUILD_TIMEOUT_MS);
 
   afterAll(() => {
     if (existsSync(DIST_DIR)) {
@@ -218,11 +239,8 @@ describe('Docs Build Script (Astro)', () => {
   });
 
   it('build runs without errors (exit code 0)', () => {
-    if (!existsSync(join(DOCS_DIR, 'package.json'))) return;
-    expect(() => {
-      execSync('npm run build', { cwd: DOCS_DIR, timeout: 120_000 });
-    }).not.toThrow();
-  }, 120_000);
+    expect(requireBuild()).toBe(true);
+  });
 
   // --- 2. All section files produce HTML output ---
 
@@ -301,6 +319,7 @@ describe('Docs Build Script (Astro)', () => {
     const html = readFile(indexPath);
     expect(html).toMatch(/<!doctype html>/i);
     expect(html).toContain('Development Team');
+    expect(html).toContain('Humans stay in charge');
   });
 
   // --- 5. Blog index ---
@@ -363,4 +382,5 @@ describe('Docs Build Script (Astro)', () => {
     expect(html).toContain('id="search-btn"');
     expect(html).toContain('id="search-modal"');
   });
-});
+  },
+);

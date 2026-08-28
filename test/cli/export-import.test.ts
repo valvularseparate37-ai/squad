@@ -8,12 +8,17 @@ import { mkdir, rm, readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { existsSync } from 'fs';
 import { randomBytes } from 'crypto';
+import { tmpdir } from 'os';
 import { runInit } from '@bradygaster/squad-cli/core/init';
 import { runExport } from '@bradygaster/squad-cli/commands/export';
 import { runImport } from '@bradygaster/squad-cli/commands/import';
 
-const TEST_ROOT = join(process.cwd(), `.test-cli-export-import-${randomBytes(4).toString('hex')}`);
-const IMPORT_ROOT = join(process.cwd(), `.test-cli-import-target-${randomBytes(4).toString('hex')}`);
+const EXT_ROOT = join(tmpdir(), `.test-cli-export-ext-${randomBytes(4).toString('hex')}`);
+const EXT_GLOBAL = join(tmpdir(), `.test-cli-export-ext-global-${randomBytes(4).toString('hex')}`);
+const EXT_PROJECT_KEY = `test-export-ext-${randomBytes(4).toString('hex')}`;
+
+const TEST_ROOT = join(tmpdir(), `.test-cli-export-import-${randomBytes(4).toString('hex')}`);
+const IMPORT_ROOT = join(tmpdir(), `.test-cli-import-target-${randomBytes(4).toString('hex')}`);
 
 describe('CLI: export/import commands', () => {
   beforeEach(async () => {
@@ -229,6 +234,26 @@ describe('CLI: export/import commands', () => {
     expect(importedPolicy).toEqual(policyData);
   });
 
+  it('should preserve routing.md through export and import round-trip', async () => {
+    const teamPath = join(TEST_ROOT, '.squad', 'team.md');
+    await writeFile(teamPath, '# Team\n');
+    
+    // Create routing.md with rich content
+    const routingContent = '# Routing Rules\n\n| Pattern | Agent |\n|---------|-------|\n| build/* | fenster |\n| docs/* | pao |\n\n## Principles\n\n1. Eager by default\n2. Scribe always runs\n';
+    await writeFile(join(TEST_ROOT, '.squad', 'routing.md'), routingContent);
+    
+    // Export and import
+    const exportPath = join(TEST_ROOT, 'squad-export.json');
+    await runExport(TEST_ROOT, exportPath);
+    await runImport(IMPORT_ROOT, exportPath, false);
+    
+    // Verify routing.md was faithfully preserved
+    const importedRoutingPath = join(IMPORT_ROOT, '.squad', 'routing.md');
+    expect(existsSync(importedRoutingPath)).toBe(true);
+    const importedRouting = await readFile(importedRoutingPath, 'utf-8');
+    expect(importedRouting).toBe(routingContent);
+  });
+
   it('should mark history as imported with source info', async () => {
     const teamPath = join(TEST_ROOT, '.squad', 'team.md');
     await writeFile(teamPath, '# Team\n');
@@ -250,5 +275,150 @@ describe('CLI: export/import commands', () => {
     
     expect(history).toContain('📌 Imported from');
     expect(history).toContain('my-project-export');
+  });
+
+  it('should export and import team.md, decisions.md, and routing.md', async () => {
+    const teamPath = join(TEST_ROOT, '.squad', 'team.md');
+    await writeFile(teamPath, '# My Team\nLead: Alice\n');
+    await writeFile(join(TEST_ROOT, '.squad', 'decisions.md'), '# Decisions\n- Use TypeScript\n');
+    await writeFile(join(TEST_ROOT, '.squad', 'routing.md'), '# Routing\n- `*.ts` → fenster\n');
+
+    const exportPath = join(TEST_ROOT, 'squad-export.json');
+    await runExport(TEST_ROOT, exportPath);
+
+    // Verify manifest contains these fields
+    const content = await readFile(exportPath, 'utf-8');
+    const manifest = JSON.parse(content);
+    expect(manifest.team_md).toBe('# My Team\nLead: Alice\n');
+    expect(manifest.decisions_md).toBe('# Decisions\n- Use TypeScript\n');
+    expect(manifest.routing_md).toBe('# Routing\n- `*.ts` → fenster\n');
+
+    // Import and verify round-trip
+    await runImport(IMPORT_ROOT, exportPath, false);
+    const importedTeam = await readFile(join(IMPORT_ROOT, '.squad', 'team.md'), 'utf-8');
+    const importedDecisions = await readFile(join(IMPORT_ROOT, '.squad', 'decisions.md'), 'utf-8');
+    const importedRouting = await readFile(join(IMPORT_ROOT, '.squad', 'routing.md'), 'utf-8');
+    expect(importedTeam).toBe('# My Team\nLead: Alice\n');
+    expect(importedDecisions).toBe('# Decisions\n- Use TypeScript\n');
+    expect(importedRouting).toBe('# Routing\n- `*.ts` → fenster\n');
+  });
+
+  it('should reject agent names with path traversal', async () => {
+    const teamPath = join(TEST_ROOT, '.squad', 'team.md');
+    await writeFile(teamPath, '# Team\n');
+
+    // Create a malicious export file with path traversal in agent name
+    const maliciousManifest = {
+      version: '1.0',
+      exported_at: new Date().toISOString(),
+      squad_version: '0.6.0',
+      casting: {},
+      agents: { '../../../etc/evil': { charter: 'malicious content' } },
+      skills: [],
+    };
+    const exportPath = join(TEST_ROOT, 'malicious-export.json');
+    await writeFile(exportPath, JSON.stringify(maliciousManifest));
+
+    await expect(
+      runImport(IMPORT_ROOT, exportPath, false)
+    ).rejects.toThrow(/Invalid agent name|Path traversal/);
+  });
+
+  it('should handle older bundles without team_md/decisions_md gracefully', async () => {
+    const teamPath = join(TEST_ROOT, '.squad', 'team.md');
+    await writeFile(teamPath, '# Team\n');
+
+    // Old format bundle without team_md, decisions_md, routing_md
+    const oldManifest = {
+      version: '1.0',
+      exported_at: new Date().toISOString(),
+      squad_version: '0.6.0',
+      casting: {},
+      agents: {},
+      skills: [],
+    };
+    const exportPath = join(TEST_ROOT, 'old-export.json');
+    await writeFile(exportPath, JSON.stringify(oldManifest));
+
+    await runImport(IMPORT_ROOT, exportPath, false);
+
+    // Should write empty defaults
+    const importedTeam = await readFile(join(IMPORT_ROOT, '.squad', 'team.md'), 'utf-8');
+    const importedDecisions = await readFile(join(IMPORT_ROOT, '.squad', 'decisions.md'), 'utf-8');
+    expect(importedTeam).toBe('');
+    expect(importedDecisions).toBe('');
+    // routing.md should not be created if not in bundle
+    expect(existsSync(join(IMPORT_ROOT, '.squad', 'routing.md'))).toBe(false);
+  });
+});
+
+describe('CLI: export with externalized state (#1396)', () => {
+  const origAppData = process.env['APPDATA'];
+  const origXdgConfig = process.env['XDG_CONFIG_HOME'];
+  const externalStateDir = join(EXT_GLOBAL, 'squad', 'projects', EXT_PROJECT_KEY);
+
+  beforeEach(async () => {
+    if (existsSync(EXT_ROOT)) {
+      await rm(EXT_ROOT, { recursive: true, force: true });
+    }
+    if (existsSync(EXT_GLOBAL)) {
+      await rm(EXT_GLOBAL, { recursive: true, force: true });
+    }
+
+    // Point resolveGlobalSquadPath() inside EXT_GLOBAL (not the real user dir)
+    if (process.platform === 'win32') {
+      process.env['APPDATA'] = EXT_GLOBAL;
+    } else {
+      process.env['XDG_CONFIG_HOME'] = EXT_GLOBAL;
+    }
+
+    // Local repo: thin .squad/ holding only the marker `squad externalize` leaves behind
+    await mkdir(join(EXT_ROOT, '.squad'), { recursive: true });
+    await writeFile(
+      join(EXT_ROOT, '.squad', 'config.json'),
+      JSON.stringify({ version: 1, teamRoot: '.', projectKey: EXT_PROJECT_KEY, stateLocation: 'external' }, null, 2)
+    );
+
+    // External state dir: the real team state
+    await mkdir(join(externalStateDir, 'agents', 'alice'), { recursive: true });
+    await writeFile(join(externalStateDir, 'team.md'), '# External Team\n');
+    await writeFile(join(externalStateDir, 'decisions.md'), '# External Decisions\n');
+    await writeFile(join(externalStateDir, 'agents', 'alice', 'charter.md'), '# Alice Charter\n');
+  });
+
+  afterEach(async () => {
+    if (origAppData === undefined) delete process.env['APPDATA'];
+    else process.env['APPDATA'] = origAppData;
+    if (origXdgConfig === undefined) delete process.env['XDG_CONFIG_HOME'];
+    else process.env['XDG_CONFIG_HOME'] = origXdgConfig;
+
+    if (existsSync(EXT_ROOT)) {
+      await rm(EXT_ROOT, { recursive: true, force: true });
+    }
+    if (existsSync(EXT_GLOBAL)) {
+      await rm(EXT_GLOBAL, { recursive: true, force: true });
+    }
+  });
+
+  it('exports team state from the external state dir', async () => {
+    await runExport(EXT_ROOT);
+
+    const exportPath = join(EXT_ROOT, 'squad-export.json');
+    expect(existsSync(exportPath)).toBe(true);
+
+    const manifest = JSON.parse(await readFile(exportPath, 'utf-8'));
+    expect(manifest.team_md).toBe('# External Team\n');
+    expect(manifest.decisions_md).toBe('# External Decisions\n');
+    expect(manifest.agents['alice']?.charter).toBe('# Alice Charter\n');
+  });
+
+  it('prefers external state over stale local files when the marker is set', async () => {
+    // Simulate local scaffolding re-created after externalize (e.g. a re-run init)
+    await writeFile(join(EXT_ROOT, '.squad', 'team.md'), '# Stale Local Scaffold\n');
+
+    await runExport(EXT_ROOT);
+
+    const manifest = JSON.parse(await readFile(join(EXT_ROOT, 'squad-export.json'), 'utf-8'));
+    expect(manifest.team_md).toBe('# External Team\n');
   });
 });

@@ -235,7 +235,7 @@ describe('Compat v0.4.1: Config Path Equivalence', () => {
 
   it('DEFAULT_CONFIG has expected shape', () => {
     expect(DEFAULT_CONFIG.version).toBe('1.0.0');
-    expect(DEFAULT_CONFIG.models.defaultModel).toBe('claude-sonnet-4.6');
+    expect(DEFAULT_CONFIG.models.defaultModel).toBe('gpt-5.6-terra');
     expect(DEFAULT_CONFIG.models.defaultTier).toBe('standard');
     expect(DEFAULT_CONFIG.routing.rules.length).toBeGreaterThanOrEqual(1);
     expect(DEFAULT_CONFIG.casting?.allowlistUniverses).toBeDefined();
@@ -253,16 +253,28 @@ describe('Compat v0.4.1: Config Path Equivalence', () => {
 // ============================================================================
 
 describe('Compat v0.4.1: Tool Registration', () => {
-  it('ToolRegistry registers all 5 built-in tools', () => {
+  it('ToolRegistry registers all built-in tools', () => {
     const registry = new ToolRegistry();
     const tools = registry.getTools();
-    expect(tools.length).toBe(5);
+    expect(tools.length).toBe(17);
     const names = tools.map((t) => t.name);
     expect(names).toEqual(
       expect.arrayContaining([
         'squad_route',
         'squad_decide',
         'squad_memory',
+        'squad_state_read',
+        'squad_state_write',
+        'squad_state_append',
+        'squad_state_delete',
+        'squad_state_list',
+        'squad_state_health',
+        'memory.classify',
+        'memory.write',
+        'memory.search',
+        'memory.promote',
+        'memory.delete',
+        'memory.audit',
         'squad_status',
         'squad_skill',
       ]),
@@ -292,7 +304,7 @@ describe('Compat v0.4.1: Tool Registration', () => {
   it('getToolsForAgent returns all when no filter', () => {
     const registry = new ToolRegistry();
     const all = registry.getToolsForAgent(undefined);
-    expect(all.length).toBe(5);
+    expect(all.length).toBe(17);
   });
 });
 
@@ -454,32 +466,33 @@ describe('Compat v0.4.1: Event Bus Shape', () => {
 
 describe('Compat v0.4.1: Model Catalog', () => {
   it('catalog contains expected premium models', () => {
+    expect(isModelAvailable('claude-opus-5')).toBe(true);
     expect(isModelAvailable('claude-opus-4.6')).toBe(true);
-    expect(isModelAvailable('claude-opus-4.5')).toBe(true);
+    expect(isModelAvailable('claude-opus-4.8')).toBe(true);
   });
 
   it('catalog contains expected standard models', () => {
     expect(isModelAvailable('claude-sonnet-4.5')).toBe(true);
-    expect(isModelAvailable('claude-sonnet-4')).toBe(true);
-    expect(isModelAvailable('gpt-5.2-codex')).toBe(true);
+    expect(isModelAvailable('claude-sonnet-4.6')).toBe(true);
+    expect(isModelAvailable('gpt-5.4')).toBe(true);
   });
 
   it('catalog contains expected fast models', () => {
     expect(isModelAvailable('claude-haiku-4.5')).toBe(true);
-    expect(isModelAvailable('gpt-5.1-codex-mini')).toBe(true);
-    expect(isModelAvailable('gpt-4.1')).toBe(true);
+    expect(isModelAvailable('gpt-5.4-mini')).toBe(true);
+    expect(isModelAvailable('gpt-5-mini')).toBe(true);
   });
 
-  it('premium fallback chain starts with opus', () => {
-    expect(DEFAULT_FALLBACK_CHAINS.premium[0]).toBe('claude-opus-4.6');
+  it('premium fallback chain starts with GPT Sol', () => {
+    expect(DEFAULT_FALLBACK_CHAINS.premium[0]).toBe('gpt-5.6-sol');
   });
 
-  it('standard fallback chain starts with sonnet', () => {
-    expect(DEFAULT_FALLBACK_CHAINS.standard[0]).toBe('claude-sonnet-4.6');
+  it('standard fallback chain starts with GPT Terra', () => {
+    expect(DEFAULT_FALLBACK_CHAINS.standard[0]).toBe('gpt-5.6-terra');
   });
 
-  it('fast fallback chain starts with haiku', () => {
-    expect(DEFAULT_FALLBACK_CHAINS.fast[0]).toBe('claude-haiku-4.5');
+  it('fast fallback chain starts with Luna', () => {
+    expect(DEFAULT_FALLBACK_CHAINS.fast[0]).toBe('gpt-5.6-luna');
   });
 
   it('getModelInfo returns correct tier for known models', () => {
@@ -618,5 +631,27 @@ describe('Compat v0.4.1: Version Comparison', () => {
 
   it('parseSemVer rejects invalid format', () => {
     expect(() => parseSemVer('not-a-version')).toThrow();
+  });
+});
+
+// ============================================================================
+// 12. Removed model IDs degrade safely through fallback chains
+// ============================================================================
+
+describe('Compat v0.4.1: Removed Model Fallback Degradation', () => {
+  it('getNextFallback for removed "gpt-4.1" resolves to a live catalog model without throwing', () => {
+    const registry = new ModelRegistry();
+    let result: string | null;
+    expect(() => { result = registry.getNextFallback('gpt-4.1', 'standard'); }).not.toThrow();
+    expect(result!).not.toBeNull();
+    expect(isModelAvailable(result!)).toBe(true);
+  });
+
+  it('getNextFallback for removed "claude-sonnet-4" resolves to a live catalog model without throwing', () => {
+    const registry = new ModelRegistry();
+    let result: string | null;
+    expect(() => { result = registry.getNextFallback('claude-sonnet-4', 'standard'); }).not.toThrow();
+    expect(result!).not.toBeNull();
+    expect(isModelAvailable(result!)).toBe(true);
   });
 });

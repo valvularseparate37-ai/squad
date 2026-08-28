@@ -7,9 +7,10 @@
  * @module agents/onboarding
  */
 
-import { mkdir, writeFile, readFile } from 'fs/promises';
 import { join } from 'path';
-import { existsSync } from 'fs';
+import type { StorageProvider } from '../storage/storage-provider.js';
+import { FSStorageProvider } from '../storage/fs-storage-provider.js';
+import type { SquadState } from '../state/squad-state.js';
 
 // ============================================================================
 // Onboarding Types
@@ -182,6 +183,31 @@ ${context || 'Context will be provided by the team.'}
 - Loop until the board is clear, then idle
 `,
 
+  'Rai': (displayName: string, context?: string) => `# ${displayName} — Responsible AI Reviewer
+
+Background reviewer that checks contributions for responsible AI concerns before they merge.
+
+## Project Context
+
+${context || 'Context will be provided by the team.'}
+
+## Responsibilities
+
+- Review PRs and design docs for RAI policy compliance
+- Flag bias, safety, privacy, transparency, and fairness concerns
+- Issue traffic-light verdicts: GREEN (pass), YELLOW (advisory), RED (blocking)
+- Maintain .squad/rai/audit-trail.md with review records
+- Reference .squad/rai/policy.md for team-specific standards
+
+## Work Style
+
+- Operate in the background — never block unless a RED violation is found
+- Keep reviews concise and actionable
+- Cite specific policy sections when flagging issues
+- Respect opt-out markers in code comments
+- Never modify source code — only advise
+`,
+
   'designer': (displayName: string, context?: string) => `# ${displayName} — User Experience Designer
 
 User experience designer focused on interface design and user interactions.
@@ -318,7 +344,11 @@ function titleCase(str: string): string {
  * @param options - Onboarding options
  * @returns Result with created file paths
  */
-export async function onboardAgent(options: OnboardOptions): Promise<OnboardResult> {
+export async function onboardAgent(
+  options: OnboardOptions,
+  storage: StorageProvider = new FSStorageProvider(),
+  state?: SquadState,
+): Promise<OnboardResult> {
   const {
     teamRoot,
     agentName,
@@ -347,11 +377,11 @@ export async function onboardAgent(options: OnboardOptions): Promise<OnboardResu
   
   // Create agent directory
   const agentDir = join(teamRoot, '.squad', 'agents', normalizedName);
-  if (existsSync(agentDir)) {
+  if (await storage.exists(agentDir)) {
     throw new Error(`Agent directory already exists: ${agentDir}`);
   }
   
-  await mkdir(agentDir, { recursive: true });
+  // Write charter.md (storage.write auto-creates parent directories)
   
   // Determine display name
   const effectiveDisplayName = displayName || titleCase(normalizedName);
@@ -369,11 +399,6 @@ export async function onboardAgent(options: OnboardOptions): Promise<OnboardResu
     }
   }
   
-  // Write charter.md
-  const charterPath = join(agentDir, 'charter.md');
-  await writeFile(charterPath, charterContent, 'utf-8');
-  createdFiles.push(charterPath);
-  
   // Generate history
   const historyContent = generateHistory(
     effectiveDisplayName,
@@ -381,11 +406,24 @@ export async function onboardAgent(options: OnboardOptions): Promise<OnboardResu
     projectContext,
     userName
   );
-  
-  // Write history.md
+
+  // Write agent files — use SquadState when available, raw storage otherwise
+  const charterPath = join(agentDir, 'charter.md');
   const historyPath = join(agentDir, 'history.md');
-  await writeFile(historyPath, historyContent, 'utf-8');
-  createdFiles.push(historyPath);
+
+  // When state is provided, prefer its underlying provider for consistency
+  const effectiveStorage = state ? state.provider : storage;
+
+  if (state) {
+    // SquadState.agents.create() writes charter + generic history.
+    // We write charter via state, then overwrite history with our richer template.
+    await state.agents.create(normalizedName, charterContent);
+    await effectiveStorage.write(historyPath, historyContent);
+  } else {
+    await effectiveStorage.write(charterPath, charterContent);
+    await effectiveStorage.write(historyPath, historyContent);
+  }
+  createdFiles.push(charterPath, historyPath);
   
   return {
     createdFiles,
@@ -409,18 +447,74 @@ export async function onboardAgent(options: OnboardOptions): Promise<OnboardResu
 export async function addAgentToConfig(
   teamRoot: string,
   agentName: string,
-  role: string
+  role: string,
+  storage: StorageProvider = new FSStorageProvider()
 ): Promise<boolean> {
   const configPath = join(teamRoot, 'squad.config.ts');
   
-  if (!existsSync(configPath)) {
+  if (!await storage.exists(configPath)) {
     return false; // No TypeScript config to update
   }
   
   try {
-    const content = await readFile(configPath, 'utf-8');
-    
-    // Simple heuristic: add routing rule if role matches common work types
+    const content = await storage.read(configPath);
+    if (content === undefined) {
+      return false;
+    }
+
+    // Check if this agent is already defined in the config
+    const agentNamePattern = new RegExp(`name:\\s*['"]${agentName}['"]`);
+    if (agentNamePattern.test(content)) {
+      return false; // Agent already in config
+    }
+
+    // Find the agents array and add new agent definition
+    // Match patterns like: agents: [ ... ] or .agents([ ... ])
+    const agentsArrayPattern = /agents:\s*\[([\s\S]*?)\](?=\s*[,}\)])/g;
+    const builderPattern = /\.agents\(\s*\[([\s\S]*?)\]\s*\)/;
+
+    let updatedContent = content;
+    let modified = false;
+
+    const newAgentDef = `    {
+      name: '${agentName}',
+      role: '${role}',
+    }`;
+
+    let arrayMatch: RegExpExecArray | null;
+    let targetMatch: RegExpExecArray | null = null;
+    while ((arrayMatch = agentsArrayPattern.exec(content)) !== null) {
+      const existingAgents = arrayMatch[1]!;
+      if (existingAgents.includes('{') || existingAgents.trim() === '') {
+        targetMatch = arrayMatch;
+        break;
+      }
+    }
+
+    if (targetMatch) {
+      const existingAgents = targetMatch[1]!.trimEnd();
+      const separator = existingAgents.trim() ? ',\n' : '\n';
+      const updatedAgents = existingAgents + separator + newAgentDef;
+      updatedContent =
+        content.slice(0, targetMatch.index) +
+        `agents: [${updatedAgents}\n  ]` +
+        content.slice(targetMatch.index + targetMatch[0].length);
+      modified = true;
+    } else {
+      const builderMatch = content.match(builderPattern);
+      if (builderMatch) {
+        const existingAgents = builderMatch[1]!.trimEnd();
+        const separator = existingAgents.trim() ? ',\n' : '\n';
+        const updatedAgents = existingAgents + separator + newAgentDef;
+        updatedContent = content.replace(
+          builderPattern,
+          `.agents([\n${updatedAgents}\n  ])`
+        );
+        modified = true;
+      }
+    }
+
+    // Optionally add routing rule if role maps to a known work type
     const workTypeMap: Record<string, string> = {
       'developer': 'feature-dev',
       'tester': 'testing',
@@ -430,37 +524,34 @@ export async function addAgentToConfig(
     };
     
     const workType = workTypeMap[role.toLowerCase()];
-    if (!workType) {
-      return false; // No obvious work type mapping
-    }
-    
-    // Check if this work type already has a rule
-    const workTypePattern = new RegExp(`workType:\\s*['"]${workType}['"]`);
-    if (workTypePattern.test(content)) {
-      return false; // Already has a rule for this work type
-    }
-    
-    // Find the routing rules array and add new rule
-    const rulesPattern = /rules:\s*\[([^\]]*)\]/s;
-    const match = content.match(rulesPattern);
-    
-    if (!match) {
-      return false; // Cannot parse rules array
-    }
-    
-    const newRule = `      {
+    if (workType) {
+      const workTypePattern = new RegExp(`workType:\\s*['"]${workType}['"]`);
+      if (!workTypePattern.test(updatedContent)) {
+        const rulesPattern = /rules:\s*\[([\s\S]*?)\](?=\s*[,}\)])/;
+        const rulesMatch = updatedContent.match(rulesPattern);
+        if (rulesMatch) {
+          const newRule = `      {
         workType: '${workType}',
         agents: ['@${agentName}'],
         confidence: 'high'
       }`;
-    
-    const updatedRules = match[1]!.trim() + ',\n' + newRule;
-    const updatedContent = content.replace(
-      rulesPattern,
-      `rules: [\n${updatedRules}\n    ]`
-    );
-    
-    await writeFile(configPath, updatedContent, 'utf-8');
+          const existingRules = rulesMatch[1]!.trimEnd();
+          const separator = existingRules.trim() ? ',\n' : '\n';
+          const updatedRules = existingRules + separator + newRule;
+          updatedContent = updatedContent.replace(
+            rulesPattern,
+            `rules: [${updatedRules}\n    ]`
+          );
+          modified = true;
+        }
+      }
+    }
+
+    if (!modified) {
+      return false; // Cannot find an agent array or routing rule to update
+    }
+
+    await storage.write(configPath, updatedContent);
     return true;
   } catch (error) {
     // Silently fail if we can't parse/update the config

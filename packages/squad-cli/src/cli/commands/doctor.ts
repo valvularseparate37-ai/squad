@@ -10,14 +10,20 @@
  * @module cli/commands/doctor
  */
 
-import fs from 'node:fs';
 import path from 'node:path';
+import { execFile, execFileSync } from 'node:child_process';
+import { FSStorageProvider, resolveStateBackend, type StateBackendType } from '@bradygaster/squad-sdk';
+import { resolveStateDir } from '../core/effective-squad-dir.js';
+
+const storage = new FSStorageProvider();
 
 /** Result of a single diagnostic check. */
 export interface DoctorCheck {
   name: string;
   status: 'pass' | 'fail' | 'warn';
   message: string;
+  /** Optional severity hint for display; keeps the status union stable. */
+  severity?: 'info';
 }
 
 /** Detected squad layout mode. */
@@ -34,20 +40,18 @@ interface ModeInfo {
 // ── helpers ─────────────────────────────────────────────────────────
 
 function fileExists(p: string): boolean {
-  return fs.existsSync(p);
+  return storage.existsSync(p);
 }
 
 function isDirectory(p: string): boolean {
-  try {
-    return fs.statSync(p).isDirectory();
-  } catch {
-    return false;
-  }
+  return storage.isDirectorySync(p);
 }
 
 function tryReadJson(p: string): unknown | undefined {
   try {
-    return JSON.parse(fs.readFileSync(p, 'utf8'));
+    const raw = storage.readSync(p);
+    if (!raw) return undefined;
+    return JSON.parse(raw);
   } catch {
     return undefined;
   }
@@ -158,7 +162,7 @@ function checkTeamMd(squadDir: string): DoctorCheck {
   if (!fileExists(teamPath)) {
     return { name: 'team.md found with ## Members header', status: 'fail', message: 'file not found' };
   }
-  const content = fs.readFileSync(teamPath, 'utf8');
+  const content = storage.readSync(teamPath) ?? '';
   if (!content.includes('## Members')) {
     return { name: 'team.md found with ## Members header', status: 'warn', message: 'file exists but missing ## Members header' };
   }
@@ -181,8 +185,8 @@ function checkAgentsDir(squadDir: string): DoctorCheck {
   }
   let count = 0;
   try {
-    for (const entry of fs.readdirSync(agentsDir, { withFileTypes: true })) {
-      if (entry.isDirectory()) count++;
+    for (const entry of storage.listSync(agentsDir)) {
+      if (storage.isDirectorySync(path.join(agentsDir, entry))) count++;
     }
   } catch { /* empty */ }
   return {
@@ -204,8 +208,57 @@ function checkCastingRegistry(squadDir: string): DoctorCheck {
   return { name: 'casting/registry.json exists', status: 'pass', message: 'file present, valid JSON' };
 }
 
-function checkDecisionsMd(squadDir: string): DoctorCheck {
-  const exists = fileExists(path.join(squadDir, 'decisions.md'));
+function configuredStateBackend(squadDir: string): StateBackendType | undefined {
+  const configPath = path.join(squadDir, 'config.json');
+  if (!fileExists(configPath)) return undefined;
+
+  const config = tryReadJson(configPath) as Record<string, unknown> | undefined;
+  const backend = config?.['stateBackend'];
+  if (backend === 'worktree') return 'local';
+  if (backend === 'git-notes') return 'two-layer';
+  if (backend === 'external') return 'external-stub';
+  if (backend === 'local' || backend === 'external-stub' || backend === 'orphan' || backend === 'two-layer') {
+    return backend;
+  }
+  return undefined;
+}
+
+function checkBackendDecisionsMd(cwd: string, squadDir: string, stateBackend: 'orphan' | 'two-layer'): DoctorCheck {
+  try {
+    const backend = resolveStateBackend(squadDir, cwd, stateBackend);
+    if (backend.name !== stateBackend) {
+      return {
+        name: 'decisions.md exists',
+        status: 'fail',
+        message: `configured '${stateBackend}' backend was not available; resolved '${backend.name}' instead and could not inspect squad-state`,
+      };
+    }
+
+    const exists = backend.exists('decisions.md');
+    return {
+      name: 'decisions.md exists',
+      status: exists ? 'pass' : 'fail',
+      message: exists
+        ? `file present in squad-state (${stateBackend} backend)`
+        : `file not found in squad-state (${stateBackend} backend)`,
+    };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      name: 'decisions.md exists',
+      status: 'fail',
+      message: `could not inspect squad-state for '${stateBackend}' backend: ${msg}`,
+    };
+  }
+}
+
+function checkDecisionsMd(cwd: string, squadDir: string, stateDir: string): DoctorCheck {
+  const stateBackend = configuredStateBackend(squadDir);
+  if (stateBackend === 'orphan' || stateBackend === 'two-layer') {
+    return checkBackendDecisionsMd(cwd, squadDir, stateBackend);
+  }
+
+  const exists = fileExists(path.join(stateDir, 'decisions.md'));
   return {
     name: 'decisions.md exists',
     status: exists ? 'pass' : 'fail',
@@ -327,10 +380,21 @@ function checkVscodeJsonrpcExports(cwd: string): DoctorCheck {
     };
   }
 
+  // Detect whether we're in a local dev context (node_modules exists) or global install
+  const hasNodeModules = isDirectory(path.join(cwd, 'node_modules'));
+  if (hasNodeModules) {
+    return {
+      name: 'vscode-jsonrpc exports field',
+      status: 'warn',
+      message: 'not found in node_modules — run npm install or check dependencies',
+    };
+  }
+
   return {
     name: 'vscode-jsonrpc exports field',
     status: 'warn',
-    message: 'vscode-jsonrpc not found in node_modules — expected for global CLI installs. For local development, run: npm install',
+    severity: 'info',
+    message: 'not found in node_modules (expected for global installs)',
   };
 }
 
@@ -348,7 +412,7 @@ function checkCopilotSdkSessionPatch(cwd: string): DoctorCheck {
     if (!fileExists(sessionPath)) continue;
 
     try {
-      const content = fs.readFileSync(sessionPath, 'utf8');
+      const content = storage.readSync(sessionPath) ?? '';
 
       if (/from\s+["']vscode-jsonrpc\/node["']/.test(content)) {
         return {
@@ -372,10 +436,21 @@ function checkCopilotSdkSessionPatch(cwd: string): DoctorCheck {
     }
   }
 
+  // Detect whether we're in a local dev context (node_modules exists) or global install
+  const hasNodeModules = isDirectory(path.join(cwd, 'node_modules'));
+  if (hasNodeModules) {
+    return {
+      name: 'copilot-sdk session.js ESM patch',
+      status: 'warn',
+      message: 'not found in node_modules — run npm install or check dependencies',
+    };
+  }
+
   return {
     name: 'copilot-sdk session.js ESM patch',
     status: 'warn',
-    message: '@github/copilot-sdk not found in node_modules — expected for global CLI installs. For local development, run: npm install',
+    severity: 'info',
+    message: 'not found in node_modules (expected for global installs)',
   };
 }
 
@@ -389,7 +464,7 @@ function checkSquadAgentMd(cwd: string): DoctorCheck {
     };
   }
   try {
-    const content = fs.readFileSync(agentMdPath, 'utf8');
+    const content = storage.readSync(agentMdPath) ?? '';
     if (content.trim().length === 0) {
       return {
         name: '.github/agents/squad.agent.md',
@@ -408,6 +483,206 @@ function checkSquadAgentMd(cwd: string): DoctorCheck {
     name: '.github/agents/squad.agent.md',
     status: 'pass',
     message: 'file present (Copilot agent discovery file)',
+  };
+}
+
+// ── copilot CLI check ───────────────────────────────────────────────
+
+/**
+ * Check that the Copilot CLI is reachable (needed by watch capabilities).
+ * Tests `copilot --version` with shell:true for Windows compatibility.
+ */
+function checkCopilotCli(): Promise<DoctorCheck> {
+  return new Promise((resolve) => {
+    execFile('copilot', ['--version'], { shell: true, timeout: 5000 }, (err) => {
+      if (err) {
+        resolve({
+          name: 'Copilot CLI available',
+          status: 'warn',
+          message:
+            "'copilot --version' failed — watch capabilities (monitor-teams, monitor-email, retro, decision-hygiene) require the Copilot CLI. " +
+            "If you installed the GitHub CLI extension, ensure 'copilot' is also available on your PATH, or set --agent-cmd to override.",
+        });
+      } else {
+        resolve({
+          name: 'Copilot CLI available',
+          status: 'pass',
+          message: 'copilot CLI reachable',
+        });
+      }
+    });
+  });
+}
+
+// ── git sync hooks check ─────────────────────────────────────────────
+
+const SQUAD_SYNC_HOOK_MARKER = '# --- squad-sync-hook ---';
+// Must match the full set installed by install-hooks.ts: the four sync hooks
+// plus pre-commit/post-commit, which guard and flush two-layer state (#1190).
+const REQUIRED_SYNC_HOOKS = ['pre-push', 'post-merge', 'post-rewrite', 'post-checkout', 'pre-commit', 'post-commit'] as const;
+
+/**
+ * Check that squad git sync hooks are installed when the state backend requires them.
+ * Only runs for 'two-layer' and 'orphan' backends (which need hooks to push state branches).
+ * Returns undefined when the check is not applicable.
+ */
+export function checkGitSyncHooks(cwd: string, squadDir: string): DoctorCheck | undefined {
+  const stateBackend = configuredStateBackend(squadDir);
+  if (stateBackend !== 'two-layer' && stateBackend !== 'orphan') return undefined;
+
+  // Resolve the git hooks directory (respects core.hooksPath when configured)
+  let hooksDir: string;
+  try {
+    const customPath = execFileSync('git', ['config', '--get', 'core.hooksPath'], {
+      cwd,
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    if (customPath) {
+      hooksDir = path.isAbsolute(customPath) ? customPath : path.resolve(cwd, customPath);
+    } else {
+      throw new Error('empty hooksPath');
+    }
+  } catch {
+    // core.hooksPath not configured — resolve via git rev-parse --git-dir
+    // This handles git worktrees correctly (unlike hardcoding .git/hooks)
+    try {
+      const gitDir = execFileSync('git', ['rev-parse', '--git-dir'], {
+        cwd,
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }).trim();
+      hooksDir = path.resolve(cwd, gitDir, 'hooks');
+    } catch {
+      hooksDir = path.join(cwd, '.git', 'hooks');
+    }
+  }
+
+  const missingHooks: string[] = [];
+  for (const hookName of REQUIRED_SYNC_HOOKS) {
+    const hookPath = path.join(hooksDir, hookName);
+    if (!fileExists(hookPath)) {
+      missingHooks.push(hookName);
+      continue;
+    }
+    try {
+      const content = storage.readSync(hookPath) ?? '';
+      if (!content.includes(SQUAD_SYNC_HOOK_MARKER)) {
+        missingHooks.push(hookName);
+      }
+    } catch {
+      missingHooks.push(hookName);
+    }
+  }
+
+  if (missingHooks.length > 0) {
+    return {
+      name: 'git sync hooks installed',
+      status: 'fail',
+      message:
+        `Missing squad sync hooks for '${stateBackend}' backend: ${missingHooks.join(', ')}. ` +
+        `Run 'squad install-hooks' to install them.`,
+    };
+  }
+
+  return {
+    name: 'git sync hooks installed',
+    status: 'pass',
+    message: `squad sync hooks present for '${stateBackend}' backend`,
+  };
+}
+
+// ── working-tree EOL check ───────────────────────────────────────────
+
+/** Repair command surfaced to the developer when the check fails. */
+const CRLF_FIX_COMMAND = 'npm run fix:crlf';
+
+/**
+ * Parse one `git ls-files --eol -z` record.
+ *
+ * Shape is `i/<eol>` `w/<eol>` `attr/<value>` TAB `<path>`. The first three
+ * fields are space-padded to fixed columns and the attr value itself contains
+ * a space ("text eol=lf"), so the path is everything after the first TAB and
+ * the field block is split on whitespace runs rather than by column.
+ */
+function parseEolRecord(record: string): { worktree: string; attr: string; file: string } | undefined {
+  const tab = record.indexOf('\t');
+  if (tab === -1) return undefined;
+  const match = /^i\/(\S*)\s+w\/(\S*)\s+attr\/(.*)$/.exec(record.slice(0, tab));
+  if (!match) return undefined;
+  return { worktree: match[2] ?? '', attr: (match[3] ?? '').trim(), file: record.slice(tab + 1) };
+}
+
+/**
+ * Check that every LF-pinned file is actually LF *on disk*.
+ *
+ * `.gitattributes` governs checkout, not files already on disk: git only
+ * re-smudges a working file when the pull also changes that file's index
+ * content. So adding an `eol=lf` rule leaves every already-LF-in-index path
+ * still CRLF on disk in existing Windows checkouts, indefinitely (#1793).
+ * The symptom is not an error — a CRLF shebang survives Vite's shebang
+ * stripping as a bare `#`, the module fails to parse, and the vitest suite
+ * importing it reports "no tests". A green-looking zero (#1788).
+ *
+ * DELIBERATELY A SEPARATE IMPLEMENTATION FROM scripts/check-shebang-eol.mjs,
+ * which owns the same invariant family for repo tooling. That script is a repo
+ * script and is not published inside this package, so `dist/` cannot import it
+ * without breaking every installed copy of the CLI. Do not "deduplicate" these
+ * by adding an import across that boundary. What they must keep in sync is the
+ * record-parsing shape above, which is pinned by tests on both sides.
+ *
+ * Returns undefined when the check does not apply (not a git repo, git absent,
+ * or no LF-pinned files at all), matching the other conditional checks.
+ */
+export function checkWorktreeEol(cwd: string): DoctorCheck | undefined {
+  let records: string[];
+  try {
+    records = execFileSync('git', ['ls-files', '--eol', '-z'], {
+      cwd,
+      encoding: 'utf-8',
+      maxBuffer: 1 << 28,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+      .split('\0')
+      .filter(Boolean);
+  } catch {
+    return undefined; // not a git repo, or git unavailable — not applicable
+  }
+
+  const stale: string[] = [];
+  let pinned = 0;
+  for (const record of records) {
+    const parsed = parseEolRecord(record);
+    if (!parsed) continue;
+    if (!/(^|\s)eol=lf(\s|$)/.test(parsed.attr)) continue;
+    pinned += 1;
+    // `mixed` is the same defect partially applied: under an eol=lf pin any CR
+    // in the working file is wrong.
+    if (parsed.worktree === 'crlf' || parsed.worktree === 'mixed') stale.push(parsed.file);
+  }
+
+  if (pinned === 0) return undefined; // no eol=lf rules — nothing to assert
+
+  if (stale.length > 0) {
+    const sample = stale.slice(0, 5).join(', ');
+    const more = stale.length > 5 ? `, +${stale.length - 5} more` : '';
+    return {
+      name: 'working tree line endings',
+      status: 'fail',
+      message:
+        `${stale.length} of ${pinned} LF-pinned file(s) still have CRLF on disk (${sample}${more}). ` +
+        `A .gitattributes eol=lf rule does not rewrite files that were already checked out, so pulling the ` +
+        `fix does not repair an existing checkout. A CRLF shebang makes a vitest suite silently load zero ` +
+        `tests. Run '${CRLF_FIX_COMMAND}' to repair, then re-run 'squad doctor' to confirm. To inspect ` +
+        `the raw state: 'git ls-files --eol' — every entry whose attr includes eol=lf should read w/lf ` +
+        `(the pin is not limited to *.mjs, and neither is this check).`,
+    };
+  }
+
+  return {
+    name: 'working tree line endings',
+    status: 'pass',
+    message: `${pinned} LF-pinned file(s) all LF on disk`,
   };
 }
 
@@ -440,13 +715,19 @@ export async function runDoctor(cwd?: string): Promise<DoctorCheck[]> {
 
   // 5–9 standard files (only if .squad/ exists)
   if (isDirectory(squadDir)) {
-    checks.push(checkTeamMd(squadDir));
-    checks.push(checkRoutingMd(squadDir));
-    checks.push(checkAgentsDir(squadDir));
-    checks.push(checkCastingRegistry(squadDir));
-    checks.push(checkDecisionsMd(squadDir));
+    // Resolve effective state dir for externalized files
+    const stateDir = resolveStateDir(squadDir);
+    checks.push(checkTeamMd(stateDir));
+    checks.push(checkRoutingMd(stateDir));
+    checks.push(checkAgentsDir(stateDir));
+    checks.push(checkCastingRegistry(stateDir));
+    checks.push(checkDecisionsMd(resolvedCwd, squadDir, stateDir));
     const rateLimitCheck = checkRateLimitStatus(squadDir);
     if (rateLimitCheck) checks.push(rateLimitCheck);
+
+    // Hook presence check (only for two-layer / orphan backends)
+    const hookCheck = checkGitSyncHooks(resolvedCwd, squadDir);
+    if (hookCheck) checks.push(hookCheck);
   }
 
   // 10. Copilot agent discovery file (relative to cwd, not squadDir)
@@ -458,6 +739,14 @@ export async function runDoctor(cwd?: string): Promise<DoctorCheck[]> {
   // 11-12. ESM compatibility (Node 22/24+)
   checks.push(checkVscodeJsonrpcExports(resolvedCwd));
   checks.push(checkCopilotSdkSessionPatch(resolvedCwd));
+
+  // 13. Copilot CLI availability (needed by watch capabilities)
+  checks.push(await checkCopilotCli());
+
+  // 14. Working-tree line endings (#1793) — an eol=lf rule does not repair a
+  //     checkout that predates it, and the failure mode is a silent zero-test run.
+  const worktreeEol = checkWorktreeEol(resolvedCwd);
+  if (worktreeEol) checks.push(worktreeEol);
 
   return checks;
 }
@@ -487,14 +776,16 @@ export function printDoctorReport(checks: DoctorCheck[], mode: DoctorMode): void
   console.log(`Mode: ${mode}\n`);
 
   for (const c of checks) {
-    console.log(`${STATUS_ICON[c.status]}  ${c.name} — ${c.message}`);
+    const icon = c.severity === 'info' ? 'ℹ️' : STATUS_ICON[c.status];
+    console.log(`${icon}  ${c.name} — ${c.message}`);
   }
 
   const passed = checks.filter(c => c.status === 'pass').length;
   const failed = checks.filter(c => c.status === 'fail').length;
-  const warned = checks.filter(c => c.status === 'warn').length;
+  const warned = checks.filter(c => c.status === 'warn' && c.severity !== 'info').length;
+  const infos = checks.filter(c => c.severity === 'info').length;
 
-  console.log(`\nSummary: ${passed} passed, ${failed} failed, ${warned} warnings\n`);
+  console.log(`\nSummary: ${passed} passed, ${failed} failed, ${warned} warnings, ${infos} info\n`);
 }
 
 /**

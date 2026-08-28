@@ -1,0 +1,325 @@
+# Self Upgrade
+
+> ⚠️ **Experimental** — Squad is alpha software. APIs, commands, and behavior may change between releases.
+
+
+**Try this to upgrade Squad CLI:**
+```bash
+squad upgrade --self
+```
+
+**Try this to upgrade to latest insider build:**
+```bash
+squad upgrade --self --insider
+```
+
+**Try this to upgrade both CLI and repo templates:**
+```bash
+squad upgrade --self && squad upgrade
+```
+
+Squad can upgrade itself to the latest stable or insider release, then automatically refresh your repo templates. Insider builds are published from the `dev` branch to the npm `insider` dist-tag.
+
+---
+
+## What It Does
+
+`squad upgrade --self` upgrades the Squad CLI package to the latest stable release:
+
+1. **Detects package manager** — auto-detects npm, pnpm, or yarn based on lock files
+2. **Upgrades package** — runs `npm install -g @bradygaster/squad@latest` (or pnpm/yarn equivalent)
+3. **Runs repo upgrade** — automatically runs `squad upgrade` to apply new templates
+
+**Result:**
+- Squad CLI upgraded to latest stable
+- Your repo's `.squad/` templates refreshed with latest version
+- All in one command
+
+---
+
+## Usage
+
+### Upgrade to Latest Stable
+
+```bash
+squad upgrade --self
+```
+
+**Output:**
+```
+🔄 Upgrading Squad CLI...
+   Detected package manager: npm
+   Running: npm install -g @bradygaster/squad@latest
+
+✅ Squad CLI upgraded to v0.8.0
+   Running: squad upgrade (to refresh repo templates)
+
+✅ Repo templates upgraded to v0.8.0
+```
+
+---
+
+### Upgrade to Latest Insider
+
+```bash
+squad upgrade --self --insider
+```
+
+**What's different:**
+- Installs latest **prerelease** version (e.g., `v0.9.0-insider.3`)
+- May include experimental features
+- Used for testing bleeding-edge changes
+
+**Output:**
+```
+🔄 Upgrading Squad CLI (insider)...
+   Detected package manager: pnpm
+   Running: pnpm add -g @bradygaster/squad@insider
+
+✅ Squad CLI upgraded to v0.9.0-insider.3
+   Running: squad upgrade (to refresh repo templates)
+
+✅ Repo templates upgraded to v0.9.0-insider.3
+```
+
+---
+
+## Package Manager Auto-Detection
+
+Squad auto-detects your package manager based on lock files in the current directory:
+
+| Lock File | Detected Manager | Command Used |
+|-----------|------------------|--------------|
+| `pnpm-lock.yaml` | pnpm | `pnpm add -g @bradygaster/squad@latest` |
+| `yarn.lock` | Yarn | `yarn global add @bradygaster/squad@latest` |
+| `package-lock.json` | npm | `npm install -g @bradygaster/squad@latest` |
+| *(none)* | npm (fallback) | `npm install -g @bradygaster/squad@latest` |
+
+**Notes:**
+- Detection runs in current working directory
+- If no lock file found, defaults to npm
+- For insider upgrades, `@latest` becomes `@insider`
+
+---
+
+## Auto-Refresh Repo Templates
+
+After upgrading the CLI, `squad upgrade --self` automatically runs `squad upgrade` to refresh your repo's `.squad/` templates. This ensures:
+
+- Built-in skills updated to latest versions
+- Charter templates refreshed
+- Routing/team file patterns updated
+- New features added (e.g., cleanup config, scratch dir, external state)
+
+**Skip auto-refresh:**
+
+If you want to upgrade the CLI without refreshing repo templates:
+
+```bash
+squad upgrade --self --skip-repo-upgrade
+```
+
+*(This flag may not exist yet — just showing the pattern. For now, self-upgrade always runs repo upgrade.)*
+
+### Your Customizations Are Backed Up
+
+`squad upgrade` overwrites Squad-owned files with the latest templates. Before it overwrites a file you've edited locally, it saves your version alongside it as `<file>.local-backup` and prints a warning.
+
+This covers `.github/agents/squad.agent.md` and the Squad-managed workflow files in `.github/workflows/`.
+
+```text
+⚠  squad.agent.md has local customizations — backed up to squad.agent.md.local-backup
+   To restore: copy squad.agent.md.local-backup → squad.agent.md
+⚠  squad-ci.yml has local customizations — backed up to squad-ci.yml.local-backup
+```
+
+To restore your version, copy the backup back over the refreshed file:
+
+```bash
+cp .github/agents/squad.agent.md.local-backup .github/agents/squad.agent.md
+```
+
+Three things worth knowing:
+
+- **Version stamps don't count as customizations.** The `<!-- squad-cli vX.Y.Z -->` line in `squad.agent.md` changes on every release, so it's stripped before comparing. A file that differs only by its version stamp is refreshed silently, with no backup.
+- **Only the most recent backup is kept.** Backups are written to a fixed path, so re-customizing a file and upgrading again overwrites the previous `.local-backup`. Move anything you want to keep somewhere safe before your next upgrade.
+- **Backups aren't gitignored.** They show up as untracked files in `git status`. Delete them once you've merged back what you need.
+
+`squad upgrade --dry-run` previews the upgrade and will tell you if `squad.agent.md` would be backed up. It stops short of the workflow files, so it won't flag customized workflows — check those yourself before upgrading if you've edited them.
+
+---
+
+## Permission Errors
+
+If upgrade fails with permission denied:
+
+```
+❌ Error: EACCES: permission denied
+```
+
+**Solutions:**
+
+1. **Use sudo (macOS/Linux):**
+   ```bash
+   sudo squad upgrade --self
+   ```
+
+2. **Fix npm permissions:**
+   ```bash
+   # Option A: Change npm's default directory
+   npm config set prefix ~/.npm-global
+   export PATH=~/.npm-global/bin:$PATH
+
+   # Option B: Fix permissions for /usr/local
+   sudo chown -R $(whoami) /usr/local/lib/node_modules
+   ```
+
+3. **Use a version manager (recommended):**
+   - **nvm** (Node Version Manager) — avoids global permission issues
+   - **volta** — handles global installs without sudo
+
+---
+
+## Version Check
+
+Check current Squad version:
+
+```bash
+squad --version
+```
+
+**Output:**
+```
+@bradygaster/squad v0.8.0
+```
+
+Check if a newer version is available:
+
+```bash
+npm outdated -g @bradygaster/squad
+```
+
+**Output:**
+```
+Package             Current  Wanted  Latest  Location
+@bradygaster/squad  0.7.5    0.8.0   0.8.0   global
+```
+
+---
+
+## Checking Update Status Programmatically
+
+```bash
+squad update-check --json
+```
+
+Reads the same cache the background startup check maintains and prints it as structured JSON, without making a network call:
+
+```json
+{
+  "current": "0.9.6-insider.2",
+  "channel": "insider",
+  "latest": "0.9.7-insider.1",
+  "updateAvailable": true,
+  "cacheAge": "PT2H15M",
+  "checkedAt": "2026-05-26T12:00:00.000Z"
+}
+```
+
+This gives editor extensions, coordinator instructions, and CI scripts a stable interface to query update status without replicating the OS-specific cache path or TTL-freshness logic themselves.
+
+**Flags:**
+- `--json` — structured output (shown above)
+- `--refresh` — bypass the cache and re-fetch from the npm registry now
+
+**Exit codes:** `0` (up to date, or no cache yet), `1` (update available), `2` (transport failure during `--refresh`)
+
+**Default (non-JSON) output:**
+
+```
+Current: 0.9.6-insider.2 (insider channel)
+Latest:  0.9.7-insider.1
+Update available. Run `squad upgrade --self` to install.
+```
+
+Honors `SQUAD_NO_UPDATE_CHECK=1` — exits `0` with no output (or `{}` with `--json`) and never calls the network.
+
+---
+
+## Release Channels
+
+| Channel | Tag | Description |
+|---------|-----|-------------|
+| **Stable** | `@latest` | Production-ready releases (e.g., `v0.8.0`) |
+| **Insider** | `@insider` | Prerelease builds for testing (e.g., `v0.9.0-insider.3`) |
+
+**When to use insider:**
+- You want to test upcoming features
+- You're contributing to Squad development
+- You need a bug fix before the next stable release
+
+**When to use stable:**
+- Production use
+- You want predictable, tested releases
+- You follow semantic versioning
+
+---
+
+## Workflow
+
+**Typical upgrade workflow:**
+
+1. **Check current version:**
+   ```bash
+   squad --version
+   ```
+
+2. **Upgrade CLI to latest stable:**
+   ```bash
+   squad upgrade --self
+   ```
+
+3. **Verify new version:**
+   ```bash
+   squad --version
+   ```
+
+4. **Repo templates auto-refreshed** — no extra step needed
+
+---
+
+## Notes
+
+- Self-upgrade requires network access to npm registry
+- Self-upgrade modifies global npm packages — may require elevated permissions
+- Repo upgrade (template refresh) runs automatically after successful CLI upgrade
+- If CLI upgrade fails, repo upgrade is skipped
+- Insider builds may have breaking changes — read release notes before upgrading
+
+---
+
+## Sample Prompts
+
+```
+squad upgrade --self
+```
+
+Upgrades Squad CLI to latest stable and refreshes repo templates.
+
+```
+squad upgrade --self --insider
+```
+
+Upgrades Squad CLI to latest insider/prerelease build.
+
+```
+squad --version
+```
+
+Checks current Squad CLI version.
+
+```
+npm outdated -g @bradygaster/squad
+```
+
+Checks if a newer version is available without upgrading.

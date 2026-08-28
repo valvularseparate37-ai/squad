@@ -1,6 +1,6 @@
 /**
  * M1-12 Integration Tests: Tools + Hooks + Lifecycle (#146)
- * 
+ *
  * Comprehensive integration tests verifying M1 components work together:
  * - Tool → Hook Pipeline Integration
  * - Charter → Model → Session Pipeline
@@ -37,8 +37,8 @@ import { randomUUID } from 'node:crypto';
 // Mock CopilotClient
 vi.mock('@github/copilot-sdk', () => {
   return {
-    CopilotClient: vi.fn().mockImplementation(() => {
-      return {
+    CopilotClient: vi.fn(function (this: object) {
+      Object.assign(this, {
         start: vi.fn().mockResolvedValue(undefined),
         stop: vi.fn().mockResolvedValue([]),
         forceStop: vi.fn().mockResolvedValue(undefined),
@@ -52,8 +52,14 @@ vi.mock('@github/copilot-sdk', () => {
         getAuthStatus: vi.fn().mockResolvedValue({ authenticated: true }),
         listModels: vi.fn().mockResolvedValue([]),
         on: vi.fn().mockReturnValue(() => {}),
-      };
+        onLifecycle: vi.fn().mockReturnValue(() => {}),
+      });
     }),
+    RuntimeConnection: {
+      forStdio: vi.fn(() => ({})),
+      forTcp: vi.fn(() => ({})),
+      forUri: vi.fn(() => ({})),
+    },
   };
 });
 
@@ -88,7 +94,11 @@ describe('Integration: Tool → Hook Pipeline', () => {
       const hookResult = await pipeline.runPreToolHooks(ctx);
       expect(hookResult.action).toBe('allow');
 
-      // Execute tool
+      // Execute tool. With no fanOutDepsGetter wired into ToolRegistry,
+      // the handler returns a structured failure (fan-out-deps-unavailable)
+      // rather than the previous fake-success. The point of this test is that
+      // the hook pipeline allows the call through; the tool's own outcome is
+      // determined by infra wiring (covered separately in test/tools.test.ts).
       const toolResult = await tool.handler(
         { targetAgent: 'fenster', task: 'Implement feature' } as RouteRequest,
         {
@@ -99,12 +109,13 @@ describe('Integration: Tool → Hook Pipeline', () => {
         }
       );
 
-      expect(toolResult.resultType).toBe('success');
+      expect(toolResult.resultType).toBe('failure');
+      expect((toolResult as { error?: string }).error).toBe('fan-out-deps-unavailable');
     });
 
     it('should block squad_route when custom hook blocks it', async () => {
       pipeline = new HookPipeline();
-      
+
       // Add custom hook that blocks routing to specific agents
       pipeline.addPreToolHook(async (ctx) => {
         if (ctx.toolName === 'squad_route' && (ctx.arguments as any).targetAgent === 'blocked-agent') {
@@ -134,7 +145,7 @@ describe('Integration: Tool → Hook Pipeline', () => {
       pipeline = new HookPipeline(config);
 
       const inboxPath = path.join(testRoot, 'decisions', 'inbox', 'decision-1.md');
-      
+
       const ctx: PreToolUseContext = {
         toolName: 'create',
         arguments: { path: inboxPath },
@@ -162,7 +173,7 @@ describe('Integration: Tool → Hook Pipeline', () => {
       );
 
       expect(toolResult.resultType).toBe('success');
-      
+
       // Verify file was written
       const inboxDir = path.join(testRoot, 'decisions', 'inbox');
       expect(fs.existsSync(inboxDir)).toBe(true);
@@ -233,7 +244,7 @@ describe('Integration: Tool → Hook Pipeline', () => {
       };
 
       const scrubbedResult = await pipeline.runPostToolHooks(postCtx);
-      
+
       // Check file content was written (PII in file system is OK for squad_memory)
       const historyContent = fs.readFileSync(path.join(agentDir, 'history.md'), 'utf-8');
       expect(historyContent).toContain('john.doe@example.com');
@@ -435,7 +446,7 @@ describe('Integration: Charter → Model → Session Pipeline', () => {
 
       expect(premiumResult.tier).toBe('premium');
       expect(premiumResult.fallbackChain.length).toBeGreaterThan(1);
-      expect(premiumResult.fallbackChain[0]).toBe('claude-opus-4.6');
+      expect(premiumResult.fallbackChain[0]).toBe('gpt-5.6-sol');
     });
   });
 });
@@ -463,7 +474,7 @@ describe('Integration: Hook Enforcement Scenarios', () => {
         reviewerLockout: true,
       });
       const testLockout = testPipeline.getReviewerLockout();
-      
+
       testLockout.lockout('src/auth.ts', 'reviewer-1');
 
       const ctx: PreToolUseContext = {
@@ -485,7 +496,7 @@ describe('Integration: Hook Enforcement Scenarios', () => {
         reviewerLockout: true,
       });
       const testLockout = testPipeline.getReviewerLockout();
-      
+
       testLockout.lockout('src/auth.ts', 'reviewer-1');
 
       const ctx: PreToolUseContext = {
@@ -505,9 +516,9 @@ describe('Integration: Hook Enforcement Scenarios', () => {
         reviewerLockout: true,
       });
       const testLockout = testPipeline.getReviewerLockout();
-      
+
       testLockout.lockout('src/auth.ts', 'reviewer-1');
-      
+
       let ctx: PreToolUseContext = {
         toolName: 'edit',
         arguments: { path: 'src/auth.ts' },
@@ -529,7 +540,7 @@ describe('Integration: Hook Enforcement Scenarios', () => {
   describe('PII scrub applies across tool outputs', () => {
     it('should scrub emails from different tool outputs', async () => {
       const tools = ['view', 'grep', 'squad_memory', 'powershell'];
-      
+
       for (const toolName of tools) {
         const ctx: PostToolUseContext = {
           toolName,
@@ -560,7 +571,7 @@ describe('Integration: Hook Enforcement Scenarios', () => {
 
       const result = await pipeline.runPostToolHooks(ctx);
       const scrubbed = result.result as any;
-      
+
       expect(scrubbed.users[0].email).toBe('[EMAIL_REDACTED]');
       expect(scrubbed.users[1].email).toBe('[EMAIL_REDACTED]');
       expect(scrubbed.users[0].name).toBe('Alice');
@@ -639,7 +650,7 @@ describe('Integration: Hook Enforcement Scenarios', () => {
       const executionOrder: string[] = [];
 
       const newPipeline = new HookPipeline();
-      
+
       newPipeline.addPreToolHook(async (ctx) => {
         executionOrder.push('hook-1-allow');
         return { action: 'allow' };
@@ -691,10 +702,10 @@ describe('Integration: Hook Enforcement Scenarios', () => {
       };
 
       const result = await newPipeline.runPostToolHooks(ctx);
-      
+
       // PII scrubbing should have happened
       expect(result.result).toBe('[EMAIL_REDACTED]');
-      
+
       // All hooks should execute
       expect(executionOrder.length).toBeGreaterThan(0);
     });
@@ -854,7 +865,7 @@ describe('Integration: Error Hierarchy', () => {
   describe('Tool failure wraps with ErrorFactory', () => {
     it('should wrap tool execution error', () => {
       const originalError = new Error('Tool execution failed');
-      
+
       const wrappedError = ErrorFactory.wrap(originalError, {
         sessionId: 'session-1',
         agentName: 'fenster',
@@ -884,7 +895,7 @@ describe('Integration: Error Hierarchy', () => {
 
       expect(error.category).toBe(ErrorCategory.RATE_LIMIT);
       expect(error.message).toContain('quota exceeded');
-      
+
       if (error instanceof RateLimitError) {
         expect(error.retryAfter).toBe(60);
       }
@@ -998,7 +1009,7 @@ describe('Integration: Error Hierarchy', () => {
       });
 
       const json = error.toJSON();
-      
+
       expect(json.message).toContain('Test error');
       expect(json.category).toBeDefined();
       expect(json.severity).toBeDefined();
@@ -1011,7 +1022,7 @@ describe('Integration: Error Hierarchy', () => {
       const originalError = new Error('Missing model field');
       const configError = ErrorFactory.wrap(originalError, {});
       const userMessage = configError.getUserMessage();
-      
+
       expect(userMessage.length).toBeGreaterThan(0);
       expect(userMessage).not.toContain('undefined');
     });
@@ -1027,7 +1038,7 @@ describe('Integration: End-to-End Scenarios', () => {
   beforeEach(() => {
     testRoot = path.join('.', '.test-e2e-' + randomUUID());
     registry = new ToolRegistry(testRoot);
-    
+
     const config: PolicyConfig = {
       allowedWritePaths: ['.test-e2e-*/**'],
       scrubPii: true,

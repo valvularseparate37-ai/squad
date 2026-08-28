@@ -3,6 +3,16 @@ name: Squad Release
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      confirm_tag:
+        description: 'Type v followed by the package.json version (for example v0.13.1)'
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -10,17 +20,38 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    outputs:
+      created: ${{ steps.check_tag.outputs.exists == 'false' }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 #v6
         with:
           node-version: 22
 
+      - name: Validate manual release request
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          CONFIRM_TAG: ${{ inputs.confirm_tag }}
+          RELEASE_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          expected_tag="v$(node -p 'require("./package.json").version')"
+          if [ "${RELEASE_REF}" != "refs/heads/dev" ]; then
+            echo "::error::Manual standalone releases must be dispatched from dev, not ${RELEASE_REF}."
+            exit 1
+          fi
+          if [ "${CONFIRM_TAG}" != "${expected_tag}" ]; then
+            echo "::error::confirm_tag must be ${expected_tag}, got ${CONFIRM_TAG}."
+            exit 1
+          fi
+          echo "Confirmed manual standalone release ${expected_tag} from dev."
+
       - name: Run tests
-        run: node --test test/*.test.js
+        run: node --test test/*.test.cjs
 
       - name: Validate version consistency
         run: |
@@ -75,3 +106,15 @@ jobs:
         run: |
           gh release view "${{ steps.version.outputs.tag }}"
           echo "✅ Release ${{ steps.version.outputs.tag }} created and verified."
+
+  standalone:
+    name: Publish standalone bundles
+    needs: release
+    if: needs.release.outputs.created == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/squad-standalone-release.yml
+    with:
+      upload: true
+      release_tag: ${{ needs.release.outputs.tag }}
+      source_ref: ${{ needs.release.outputs.tag }}

@@ -212,10 +212,10 @@ Read SDK docs carefully. One agent owns SDK integration/streaming, another owns 
 
 ---
 
-### 9. .NET Aspire Cloud-Native App
+### 9. Aspire Cloud-Native App
 
 ```
-Build a cloud-native app with .NET Aspire (read https://learn.microsoft.com/en-us/dotnet/aspire/):
+Build a cloud-native app with Aspire (read https://aspire.dev/):
 - AppHost orchestrating all services
 - Blazor Server dashboard: current conditions + 5-day forecast for saved cities
 - Weather API service: wraps OpenWeatherMap with Redis caching
@@ -297,7 +297,7 @@ One agent per system: economy/trading, galaxy generator/map, combat, multiplayer
 ```
 Build recipe app with image recognition (React Native Expo, Python FastAPI, SQLite):
 - Camera: photograph ingredients
-- Image analysis: GPT-4 Vision to identify ingredients
+- Image analysis: Claude Opus 5 vision to identify ingredients
 - Recipe matching: match against database (50+ recipes)
 - Recipe display: ingredients (have vs. need), instructions, time
 - Favorites: save, rate, notes

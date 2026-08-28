@@ -1,3 +1,11 @@
+---
+name: "personal-squad"
+description: "User-level AI agents that travel with you across projects"
+domain: "configuration"
+confidence: "medium"
+source: "manual"
+---
+
 # Personal Squad — Skill Document
 
 ## What is a Personal Squad?
@@ -7,8 +15,9 @@ A personal squad is a user-level collection of AI agents that travel with you ac
 ## Directory Structure
 
 ```
-~/.config/squad/personal-squad/    # Linux/macOS
-%APPDATA%/squad/personal-squad/    # Windows
+~/Library/Application Support/squad/personal-squad/    # macOS
+~/.config/squad/personal-squad/                        # Linux
+%APPDATA%/squad/personal-squad/                        # Windows
 ├── agents/
 │   ├── {agent-name}/
 │   │   ├── charter.md

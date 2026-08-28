@@ -11,9 +11,33 @@
  *   - Custom providers via ScheduleProvider interface
  */
 
-import { readFile, writeFile } from 'node:fs/promises';
-import fs from 'node:fs';
 import path from 'node:path';
+import { existsSync } from 'node:fs';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { FSStorageProvider } from '../storage/fs-storage-provider.js';
+
+const storage = new FSStorageProvider();
+const execFileAsync = promisify(execFile);
+
+/**
+ * Default ceiling on a single script task.
+ *
+ * The previous implementation used `execFileSync` which is fully blocking —
+ * a 60-second cap meant the entire Node event loop could be frozen for up
+ * to one minute per scheduled task. We now use the non-blocking
+ * promisified `execFile` with the same per-task timeout, so other timers,
+ * I/O, and telemetry exporters keep making progress while a script runs.
+ */
+const SCRIPT_DEFAULT_TIMEOUT_MS = 60_000;
+
+/**
+ * Max captured stdout for a script task. Anything larger and execFile
+ * rejects with an ERR_CHILD_PROCESS_STDIO_MAXBUFFER. The Node default is
+ * ~1 MB which is small for `git log` / `npm ls` style commands the
+ * scheduler can be configured to run.
+ */
+const SCRIPT_DEFAULT_MAX_BUFFER = 8 * 1024 * 1024;
 
 // ============================================================================
 // Schedule Schema Types
@@ -63,6 +87,15 @@ export interface TaskConfig {
   type: 'workflow' | 'script' | 'copilot' | 'webhook';
   ref: string;
   args?: Record<string, string>;
+  /**
+   * Explicit argument vector for `script` tasks (#1794).
+   *
+   * When present, `ref` is used verbatim as the executable path and is never
+   * parsed. This is the unambiguous form and should be preferred for any
+   * command path that contains spaces — e.g. the default Windows Node install
+   * at `C:\Program Files\nodejs\node.exe`.
+   */
+  argv?: string[];
 }
 
 export interface RetryConfig {
@@ -90,6 +123,21 @@ export interface TaskResult {
   success: boolean;
   output?: string;
   error?: string;
+  /** Captured stderr (rejection-only). Optional; populated on script failures. */
+  stderr?: string;
+  /** Process exit code if known (rejection-only). */
+  code?: number;
+  /**
+   * Non-numeric failure code from the OS when the child could not be spawned
+   * at all — e.g. `ENOENT` for a missing executable (#1794). Distinct from
+   * `code`, which is the child's own exit status and only exists if the child
+   * actually ran.
+   */
+  spawnError?: string;
+  /** Signal that terminated the process if known (rejection-only). */
+  signal?: string;
+  /** True iff the process was killed because it exceeded the timeout. */
+  timedOut?: boolean;
 }
 
 // ============================================================================
@@ -203,6 +251,9 @@ function validateEntry(entry: unknown, index: number, seenIds: Set<string>): voi
   if (typeof task.ref !== 'string' || task.ref.length === 0) {
     throw new ScheduleValidationError(`${prefix}.task.ref must be a non-empty string`);
   }
+  if (task.type === 'script') {
+    validateTaskRef(task.ref as string);
+  }
 
   // Providers validation
   if (!Array.isArray(e.providers) || e.providers.length === 0) {
@@ -239,7 +290,7 @@ function validateEntry(entry: unknown, index: number, seenIds: Set<string>): voi
 export async function parseSchedule(filePath: string): Promise<ScheduleManifest> {
   let raw: string;
   try {
-    raw = await readFile(filePath, 'utf8');
+    raw = await storage.read(filePath) ?? '';
   } catch (err) {
     throw new ScheduleValidationError(
       `Cannot read schedule file: ${filePath} — ${(err as Error).message}`,
@@ -358,6 +409,113 @@ function cronFieldMatches(field: string, value: number): boolean {
   return values.includes(value);
 }
 
+/**
+ * Validate a task ref for safety. Rejects null bytes and newlines which
+ * can cause issues even without shell interpretation.
+ * The structural protection comes from execFileSync (shell: false).
+ */
+/**
+ * Split a script `task.ref` into argv, honouring single and double quotes.
+ *
+ * Quotes only *group* when they open at a token boundary. A quote character
+ * appearing mid-token is a literal, so refs like
+ * `node -e console.log('hi')` keep passing the inner quotes straight through
+ * to the child exactly as they did when this function split on whitespace.
+ *
+ * Backslash is NOT an escape character: Windows paths are full of them
+ * (`C:\Program Files\nodejs\node.exe`) and treating them as escapes would
+ * mangle the modal case this exists to support (#1794).
+ *
+ * Returns whether the first token was quoted, because that removes all
+ * ambiguity about where the command ends and the arguments begin.
+ */
+export function tokenizeTaskRef(ref: string): { tokens: string[]; firstQuoted: boolean } {
+  const tokens: string[] = [];
+  let current = '';
+  let hasCurrent = false;
+  let quote: '"' | "'" | null = null;
+  let firstQuoted = false;
+
+  for (const ch of ref.trim()) {
+    if (quote !== null) {
+      if (ch === quote) {
+        quote = null;
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+    if ((ch === '"' || ch === "'") && !hasCurrent) {
+      // Opening quote at a token boundary — this one groups.
+      if (tokens.length === 0) firstQuoted = true;
+      quote = ch;
+      hasCurrent = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (hasCurrent) {
+        tokens.push(current);
+        current = '';
+        hasCurrent = false;
+      }
+      continue;
+    }
+    // Includes quote characters encountered mid-token: literal.
+    current += ch;
+    hasCurrent = true;
+  }
+
+  if (quote !== null) {
+    throw new ScheduleValidationError(`Task ref has an unterminated ${quote} quote`);
+  }
+  if (hasCurrent) tokens.push(current);
+
+  return { tokens, firstQuoted };
+}
+
+/**
+ * Decide which leading tokens form the executable path.
+ *
+ * A quoted first token is authoritative. Otherwise the plain first token is
+ * tried first, so every previously-working ref keeps its exact behaviour
+ * (including bare names resolved via PATH, which are not files on disk).
+ * Only when that fails do we widen across spaces, longest match first —
+ * mirroring how Windows CreateProcess resolves an unquoted path such as
+ * `C:\Program Files\nodejs\node.exe` (#1794).
+ */
+export function resolveScriptCommand(
+  tokens: string[],
+  firstQuoted: boolean,
+  exists: (p: string) => boolean = existsSync,
+): { command: string; args: string[] } {
+  const first = tokens[0] ?? '';
+  if (firstQuoted || tokens.length === 1) {
+    return { command: first, args: tokens.slice(1) };
+  }
+  if (exists(first)) {
+    return { command: first, args: tokens.slice(1) };
+  }
+  for (let i = tokens.length; i >= 2; i--) {
+    const candidate = tokens.slice(0, i).join(' ');
+    if (exists(candidate)) {
+      return { command: candidate, args: tokens.slice(i) };
+    }
+  }
+  return { command: first, args: tokens.slice(1) };
+}
+
+export function validateTaskRef(ref: string): void {
+  if (!ref || ref.trim().length === 0) {
+    throw new ScheduleValidationError('Task ref must be a non-empty string');
+  }
+  if (ref.includes('\0')) {
+    throw new ScheduleValidationError('Task ref must not contain null bytes');
+  }
+  if (/[\r\n]/.test(ref)) {
+    throw new ScheduleValidationError('Task ref must not contain newline characters');
+  }
+}
+
 // ============================================================================
 // Task Execution
 // ============================================================================
@@ -400,7 +558,7 @@ export async function executeTask(
  */
 export async function loadState(statePath: string): Promise<ScheduleState> {
   try {
-    const raw = await readFile(statePath, 'utf8');
+    const raw = await storage.read(statePath) ?? '';
     return JSON.parse(raw) as ScheduleState;
   } catch {
     return { runs: {} };
@@ -411,7 +569,7 @@ export async function loadState(statePath: string): Promise<ScheduleState> {
  * Save schedule state to disk.
  */
 export async function saveState(statePath: string, state: ScheduleState): Promise<void> {
-  await writeFile(statePath, JSON.stringify(state, null, 2) + '\n', 'utf8');
+  await storage.write(statePath, JSON.stringify(state, null, 2) + '\n');
 }
 
 // ============================================================================
@@ -428,15 +586,65 @@ export class LocalPollingProvider implements ScheduleProvider {
   async execute(entry: ScheduleEntry): Promise<TaskResult> {
     switch (entry.task.type) {
       case 'script': {
+        // Non-blocking script execution. execFile with `shell: false`
+        // preserves the injection-safety property of the prior execFileSync
+        // implementation (see validateTaskRef above). The async variant
+        // means timer/I/O work elsewhere in the process keeps making
+        // progress while the script runs — critical for the Ralph watch
+        // loop and OpenTelemetry exporters.
         try {
-          const { execSync } = await import('node:child_process');
-          const output = execSync(entry.task.ref, {
+          validateTaskRef(entry.task.ref);
+          // An explicit argv is unambiguous: `ref` is the executable, verbatim.
+          // Otherwise parse the ref with quote awareness and resolve a command
+          // path that may contain spaces (#1794).
+          let command: string;
+          let args: string[];
+          if (entry.task.argv) {
+            command = entry.task.ref.trim();
+            args = entry.task.argv;
+          } else {
+            const { tokens, firstQuoted } = tokenizeTaskRef(entry.task.ref);
+            ({ command, args } = resolveScriptCommand(tokens, firstQuoted));
+          }
+          const { stdout } = await execFileAsync(command, args, {
             encoding: 'utf8',
-            timeout: 60_000,
+            timeout: SCRIPT_DEFAULT_TIMEOUT_MS,
+            maxBuffer: SCRIPT_DEFAULT_MAX_BUFFER,
           });
-          return { success: true, output: output.trim() };
+          return { success: true, output: stdout.trim() };
         } catch (err) {
-          return { success: false, error: (err as Error).message };
+          // promisify(execFile) rejects with an Error decorated with extra
+          // fields when the child fails. We surface them on TaskResult so
+          // schedulers can distinguish 'timed out' from 'nonzero exit'.
+          const e = err as NodeJS.ErrnoException & {
+            stdout?: string | Buffer;
+            stderr?: string | Buffer;
+            code?: number | string;
+            signal?: NodeJS.Signals | null;
+            killed?: boolean;
+          };
+          const result: TaskResult = {
+            success: false,
+            error: e.message,
+          };
+          if (e.stdout !== undefined) result.output = e.stdout.toString().trim();
+          if (e.stderr !== undefined) result.stderr = e.stderr.toString().trim();
+          if (typeof e.code === 'number') result.code = e.code;
+          // A spawn failure (ENOENT/EACCES/...) carries a *string* code and no
+          // stdout/stderr at all — the child never ran. Previously this fell
+          // through every branch and produced `code: undefined, stderr: ''`,
+          // telling an operator nothing about what failed to spawn (#1794).
+          if (typeof e.code === 'string') {
+            result.spawnError = e.code;
+            result.error = `${e.code}: failed to spawn '${entry.task.ref}' — ${e.message}`;
+          }
+          if (e.signal) result.signal = e.signal;
+          // execFile sets `killed=true` AND `signal='SIGTERM'` when the
+          // configured `timeout` fires. Either flag is sufficient evidence.
+          if (e.killed && (e.signal === 'SIGTERM' || e.signal === 'SIGKILL')) {
+            result.timedOut = true;
+          }
+          return result;
         }
       }
       case 'workflow':
@@ -521,10 +729,10 @@ export class GitHubActionsProvider implements ScheduleProvider {
       ].join('\n') + '\n';
 
       const dir = path.dirname(workflowPath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
+      if (!storage.existsSync(dir)) {
+        storage.mkdirSync(dir, { recursive: true });
       }
-      fs.writeFileSync(workflowPath, yaml, 'utf8');
+      storage.writeSync(workflowPath, yaml);
       generated.push(workflowPath);
     }
 

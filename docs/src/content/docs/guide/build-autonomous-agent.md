@@ -150,7 +150,7 @@ export default defineSquad({
 
   defaults: defineDefaults({
     model: {
-      preferred: 'claude-sonnet-4',
+      preferred: 'claude-sonnet-5',
       rationale: 'Good balance of speed and quality for docs generation',
       fallback: 'claude-haiku-4.5',
     },
@@ -319,7 +319,7 @@ async function runLoop(
       costTracker.recordUsage({
         sessionId: agent.sessionId,
         agentName: agent.member.name,
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-sonnet-5',
         inputTokens: 1200,
         outputTokens: 800,
         estimatedCost: 0.006,
@@ -355,6 +355,8 @@ The autonomous-pipeline sample demonstrates three coordination patterns that age
 
 These patterns let agents coordinate without a central orchestrator. Each agent makes local decisions that accumulate into a shared knowledge base.
 
+> **`squad_route` requires `fanOutDepsGetter`:** For `squad_route` to actually spawn agent sessions, the `ToolRegistry` must be constructed with a `fanOutDepsGetter` callback that provides fan-out dependencies (`sessionPool`, `modelClient`, `squadRoot`, `configGetter`). Without it, the tool returns an honest `fan-out-deps-unavailable` error instead of silently succeeding. See the [SDK reference](/reference/sdk/#toolregistry) for wiring details.
+
 ---
 
 ## Add observability
@@ -371,7 +373,7 @@ import {
   recordTokenUsage,
 } from '@bradygaster/squad-sdk';
 
-// Initialize OTel (connects to .NET Aspire dashboard if endpoint is set)
+// Initialize OTel (connects to Aspire dashboard if endpoint is set)
 const otelEndpoint = process.env['OTEL_EXPORTER_OTLP_ENDPOINT'];
 if (otelEndpoint) {
   initSquadTelemetry({
@@ -397,7 +399,7 @@ recordTokenUsage({
   type: 'usage',
   sessionId: 'session-lori-0',
   agentName: 'lori',
-  model: 'claude-sonnet-4-20250514',
+  model: 'claude-sonnet-5',
   inputTokens: 1200,
   outputTokens: 800,
   estimatedCost: 0.006,
@@ -409,7 +411,7 @@ const summary = costTracker.getSummary();
 console.log(`Total: $${summary.totalEstimatedCost.toFixed(4)}`);
 ```
 
-To view traces and metrics in the .NET Aspire dashboard, see the [Aspire dashboard scenario](/scenarios/aspire-dashboard/).
+To view traces and metrics in the Aspire dashboard, see the [Aspire dashboard scenario](/scenarios/aspire-dashboard/).
 
 ---
 
@@ -504,7 +506,7 @@ while (tasks.some(t => t.status !== 'done')) {
     costTracker.recordUsage({
       sessionId: agent.sessionId,
       agentName: agent.member.name,
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-5',
       inputTokens: 1000,
       outputTokens: 600,
       estimatedCost: 0.005,
@@ -535,3 +537,11 @@ streaming.clear();
 - Read the [SDK reference](/reference/sdk/) for the complete API surface
 - See the [extensibility guide](/guide/extensibility/) for where your agent fits in the Squad ecosystem
 - Check the [Aspire dashboard scenario](/scenarios/aspire-dashboard/) for observability setup
+
+---
+
+## See Also
+
+- [Your Team](../concepts/your-team.md) — Agent roles, charters, and team composition
+- [Architecture](../concepts/architecture.md) — How the coordinator orchestrates work
+- [SDK Reference](../reference/sdk.md) — SDK API for autonomous agents
